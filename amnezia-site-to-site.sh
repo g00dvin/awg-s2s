@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version: 1.3.0 (kernel-only AmneziaWG 3.1)
+# Version: 1.3.1 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -91,7 +91,7 @@ command_text() {
     done
 }
 
-declare -A NODE_MODE NODE_HOST NODE_USER NODE_PORT NODE_KEY NODE_JUMP NODE_ALLOWED NODE_FIREWALL PLAN
+declare -A NODE_MODE NODE_HOST NODE_USER NODE_PORT NODE_KEY NODE_JUMP NODE_ALLOWED NODE_FIREWALL NODE_UPLOAD PLAN
 
 save_plan() {
     local target=$1 temporary key directory
@@ -348,11 +348,34 @@ node_command() {
     on_node "$node" "$(command_text env "AWG_INTERFACE=$INTERFACE" "AWG_ALLOWED_IPS=${NODE_ALLOWED[$node]}" "AWG_UI_ACTION=$1" bash "$REMOTE_SCRIPT" "$@")"
 }
 
+upload_script() {
+    local node=$1 uploaded=$SCRIPT_PATH temporary= status text cleanup
+    node_notice "$node" 'Installing setup script'
+    if [[ ${NODE_MODE[$node]} == ssh ]]; then
+        ssh_arguments "$node"
+        temporary=$(ssh -T "${SSH_ARGS[@]}" "${NODE_HOST[$node]}" 'set -e; umask 077; path=$(mktemp /tmp/amnezia-upload.XXXXXXXX); trap '\''rm -f -- "$path"'\'' EXIT; cat > "$path"; printf "%s\n" "$path"; trap - EXIT' < "$SCRIPT_PATH")
+        [[ $temporary =~ ^/tmp/amnezia-upload\.[a-zA-Z0-9]{8}$ ]] || fail "Unexpected upload path returned by $node"
+        uploaded=$temporary
+        NODE_UPLOAD[$node]=$temporary
+    fi
+    text="set -e; umask 077; mkdir -p /usr/local/lib; bash -n $(shell_quote "$uploaded"); install -m 700 $(shell_quote "$uploaded") $(shell_quote "$REMOTE_SCRIPT.new"); mv -f $(shell_quote "$REMOTE_SCRIPT.new") $(shell_quote "$REMOTE_SCRIPT")"
+    if on_node "$node" "$text"; then status=0; else status=$?; fi
+    if [[ -n $temporary ]]; then
+        cleanup=$(command_text rm -f -- "$temporary")
+        ssh -T "${SSH_ARGS[@]}" "${NODE_HOST[$node]}" "$cleanup" || fail "Could not remove uploaded temporary script on $node"
+        unset 'NODE_UPLOAD[$node]'
+    fi
+    return "$status"
+}
+
 controller_cleanup() {
     local node
     for node in listener connector; do
         if [[ ${NODE_MODE[$node]:-} == ssh ]]; then
             ssh_arguments "$node"
+            if [[ -n ${NODE_UPLOAD[$node]:-} ]]; then
+                ssh -T "${SSH_ARGS[@]}" "${NODE_HOST[$node]}" "$(command_text rm -f -- "${NODE_UPLOAD[$node]}")" >/dev/null 2>&1 || true
+            fi
             ssh "${SSH_ARGS[@]}" -O exit "${NODE_HOST[$node]}" >/dev/null 2>&1 || true
         fi
     done
@@ -460,7 +483,7 @@ controller() {
     ui_hint 'Listener accepts UDP. Connector initiates it. Both sides need SSH/root access.'
     ui_hint "Enter keeps a default; '-' clears an optional field. Ctrl+C saves your progress."
     begin_plan controller
-    local endpoint port listener_ip connector_ip node encoded bundle_encoded verified=1 review_status
+    local endpoint port listener_ip connector_ip node bundle_encoded verified=1 review_status
     while true; do
         if [[ $PLAN_REUSE == 1 ]] && (restore_controller_plan >/dev/null 2>&1); then
             restore_controller_plan
@@ -475,7 +498,6 @@ controller() {
     CONTROL_DIR=$(mktemp -d /tmp/amnezia-controller.XXXXXXXX)
     trap controller_cleanup EXIT
     REMOTE_SCRIPT=/usr/local/lib/amnezia-site-to-site.sh
-    encoded=$(base64 -w 0 "$SCRIPT_PATH")
 
     echo "Step 1/5: Check SSH/root access and install the script and tools"
     local listener_identity connector_identity
@@ -486,7 +508,7 @@ controller() {
     done
     [[ $listener_identity != "$connector_identity" ]] || fail "Both connections point to the same machine; choose two different servers"
     for node in listener connector; do
-        on_node "$node" "set -e; umask 077; mkdir -p /usr/local/lib; printf '%s' $(shell_quote "$encoded") | base64 -d > $REMOTE_SCRIPT.new; bash -n $REMOTE_SCRIPT.new; mv $REMOTE_SCRIPT.new $REMOTE_SCRIPT"
+        upload_script "$node"
         node_command "$node" install
     done
     echo "Step 2/5: Configure listener and securely transfer its AWG 3 bundle"
