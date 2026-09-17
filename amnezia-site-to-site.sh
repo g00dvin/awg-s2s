@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version: 1.2.1 (kernel-only AmneziaWG 3.1)
+# Version: 1.2.2 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -31,7 +31,7 @@ Defaults: interface awg-site, UDP 51830, listener 10.203.77.1,
 connector 10.203.77.2. Set AWG_INTERFACE to choose another interface.
 listener saves a confidential AWG 3 bundle; connector prints its public key.
 Run peer on the listener with that key, then up on both servers.
-By default only the peer's tunnel IPv4 /32 is routed. Firewall rules are separate.
+Table = off: tunnel routes are never installed automatically. Firewall rules are separate.
 AWG_ALLOWED_IPS adds IPv4 peer networks; the peer tunnel /32 is always included.
 AWG_PLAN_FILE overrides the wizard/controller plan path (no passwords or keys).
 Run without arguments to launch the step-by-step wizard.
@@ -203,6 +203,7 @@ configuration_table() {
     printf '%s\n' '-----------------------+--------------------------------------------+--------------------------------------------'
     printf '%-22s | %-42s | %s\n' Server "$(node_label listener)" "$(node_label connector)"
     printf '%-22s | %-42s | %s\n' Interface "$INTERFACE" "$INTERFACE"
+    printf '%-22s | %-42s | %s\n' 'Routing table' 'off (manual routes)' 'off (manual routes)'
     printf '%-22s | %-42s | %s\n' 'Tunnel IP' "$listener_ip/32" "$connector_ip/32"
     printf '%-22s | %-42s | %s\n' 'AllowedIPs (peer)' "${NODE_ALLOWED[listener]}" "${NODE_ALLOWED[connector]}"
     printf '%-22s | %-42s | %s\n' 'UDP endpoint' "Listen UDP $port" "$endpoint:$port"
@@ -212,7 +213,8 @@ configuration_table() {
         printf '[%s] SSH key: %s; jump: %s\n' "$node" "${NODE_KEY[$node]:-agent/default/password}" "${NODE_JUMP[$node]:-none}"
     done
     echo "AWG 3.1 kernel-only; MTU 1280; S1-S4=32; H1-H4=1,2,3,4; padding=16-64; cookies enabled."
-    echo "AllowedIPs sets routes and peer source addresses, not firewall permissions. LAN forwarding/NAT is not enabled."
+    echo "Table=off: AllowedIPs selects the peer and permits peer source addresses; no routes are installed."
+    echo "Configure tunnel routes, LAN forwarding and NAT manually as needed. AllowedIPs is not a firewall permission."
 }
 
 connection_details() {
@@ -330,7 +332,8 @@ controller() {
     plan_ask_validated listener_ip "Listener tunnel IPv4 address" 10.203.77.1 valid_ip; listener_ip=$ANSWER
     plan_ask_validated connector_ip "Connector tunnel IPv4 address" 10.203.77.2 valid_peer_ip "$listener_ip"; connector_ip=$ANSWER
     echo "AllowedIPs on each server describes addresses reachable THROUGH THE OTHER SERVER."
-    echo "Use comma-separated IPv4 CIDRs. The peer tunnel /32 is always included; default routes are refused."
+    echo "Use IPv4 CIDRs separated by commas or spaces. /0 is allowed; Table=off prevents automatic routes."
+    echo "The peer tunnel /32 is always included. Configure routes manually before testing tunnel IP connectivity."
     for node in listener connector; do
         if [[ $node == listener ]]; then
             plan_ask_validated "${node}_allowed" "Listener AllowedIPs: connector IP and networks behind connector" "$connector_ip/32" normalize_allowed_ips "$connector_ip" "$listener_ip"
@@ -398,6 +401,7 @@ controller() {
     echo "Step 5/5: Start both tunnels and check connectivity"
     node_command listener up
     node_command connector up
+    echo "Table=off: ping needs manually configured routes; handshake verification does not."
     if ! on_node connector "ping -c 5 -W 2 $(shell_quote "$listener_ip")"; then
         echo "Ping failed. Both configurations are saved. Check UDP access and latest handshake below."
     fi
@@ -559,7 +563,7 @@ Administrator notes
   Allow the listener's UDP port in both host and provider firewalls.
   Allow replies to outbound UDP on the connector, and desired local traffic from $INTERFACE.
   Check tunnel IPs against existing routes before configuring either server.
-  AllowedIPs routes the peer tunnel IP and explicitly selected peer networks.
+  Table=off: AllowedIPs does not install routes. Configure even the peer /32 route manually.
   LAN forwarding, return routes and firewall rules require manual administration; NAT is not enabled.
   Troubleshooting: journalctl -u $UNIT -n 50
   Stop and disable: systemctl disable --now $UNIT
@@ -662,7 +666,7 @@ wizard() {
         default_allowed=$(cat "$STATE/allowed-ips" 2>/dev/null || sed -n 's/^AllowedIPs = //p' "$CONFIG")
         default_allowed=${default_allowed:-$peer_ip/32}
     fi
-    echo "AllowedIPs means addresses behind the OTHER server; LAN forwarding and firewall rules remain manual."
+    echo "AllowedIPs selects the peer's addresses; /0 is allowed. Table=off: all tunnel routes remain manual."
     plan_ask_validated local_allowed "AllowedIPs on this server (IPv4 CIDRs separated by commas or spaces)" "$default_allowed" valid_wizard_allowed "$peer_ip" "$local_ip"
     normalize_allowed_ips "$ANSWER" "$peer_ip" "$local_ip"
     LOCAL_ALLOWED=$ALLOWED_IPS
@@ -679,7 +683,7 @@ wizard() {
     printf '\n%-22s | %s\n' Parameter "This server: $(hostname)"
     printf '%s\n' '-----------------------+--------------------------------------------'
     printf '%-22s | %s\n' Role "$role" Interface "$INTERFACE" 'Tunnel IP' "$local_ip/32" 'Peer tunnel IP' "$peer_ip/32" AllowedIPs "$LOCAL_ALLOWED" 'Listener endpoint' "$endpoint:$port" 'Firewall (1/2/3)' "$firewall" 'Bundle path' "${bundle_path:-already configured}"
-    echo "AWG 3.1 kernel-only; MTU 1280; S1-S4=32; H1-H4=1,2,3,4; padding=16-64; cookies enabled."
+    echo "AWG 3.1 kernel-only; Table=off (manual routes); MTU 1280; S1-S4=32; H1-H4=1,2,3,4; padding=16-64; cookies enabled."
     echo "Only this server will be changed. The other end must be configured separately."
     if ! approve_plan; then return; fi
 
@@ -770,7 +774,7 @@ normalize_allowed_ips() {
         address=${BASH_REMATCH[1]} prefix=${BASH_REMATCH[2]}
         valid_ip "$address"
         [[ $prefix == 0 || $prefix != 0* ]] || fail "CIDR prefix must not have leading zeros"
-        ((prefix >= 1 && prefix <= 32)) || fail "AllowedIPs prefix must be 1..32; default routes are not supported"
+        ((prefix >= 0 && prefix <= 32)) || fail "AllowedIPs prefix must be 0..32"
         mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
         ipv4_number "$address"; network=$((IP_NUMBER & mask))
         printf -v normalized '%d.%d.%d.%d/%d' "$((network >> 24))" "$(((network >> 16) & 255))" "$(((network >> 8) & 255))" "$((network & 255))" "$prefix"
@@ -788,18 +792,23 @@ warn_allowed_ips() {
         mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
         ipv4_number "$address"; network=$((IP_NUMBER & mask))
         if (( (local_number & mask) == network )); then
-            echo "Warning: AllowedIPs $cidr includes this server's tunnel IP $local_ip; broad routes may redirect other local networks. Review existing routes before confirming." >&2
+            echo "Notice: AllowedIPs $cidr includes this server's tunnel IP $local_ip. Table=off adds no routes; review your manual routing and peer source-address permissions." >&2
         fi
     done
 }
 
 check_saved_allowed_ips() {
     local requested=${AWG_ALLOWED_IPS:-} current
+    require_manual_routing
     current=$(sed -n 's/^AllowedIPs = //p' "$CONFIG")
     [[ -n $current || ! -f $STATE/allowed-ips ]] || current=$(cat "$STATE/allowed-ips")
     [[ -n $current ]] || current=${settings[1]}/32
     normalize_allowed_ips "${requested:-$current}" "${settings[1]}" "${settings[0]}"
     [[ $ALLOWED_IPS == "$current" ]] || fail "Existing AllowedIPs differs from confirmed plan; existing configuration is not overwritten. Use a new interface or coordinate changes on both servers"
+}
+
+require_manual_routing() {
+    grep -Eq '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$CONFIG" || fail "Existing profile must use Table = off. Stop its service, set Table = off in $CONFIG, configure manual routes, then rerun; existing files are not rewritten automatically"
 }
 
 valid_wizard_allowed() {
@@ -967,7 +976,7 @@ write_config() {
 [Interface]
 PrivateKey = $private_key
 Address = $LOCAL_IP/32
-Table = auto
+Table = off
 ListenPort = $PORT
 MTU = 1280
 Jc = 0
@@ -1188,6 +1197,7 @@ fi
         [[ $# -eq 1 ]] || fail "up takes no arguments"
         [[ -f $CONFIG && -f $SERVICE ]] || fail "Configure listener or connector first"
         require_profile
+        require_manual_routing
         kernel_check
         grep -q '^\[Peer\]$' "$CONFIG" || fail "Enroll the connector public key first"
         grep -q '^HeaderProtectionKey = ' "$CONFIG" || fail "AWG 3 header protection is required; configure a new interface"
