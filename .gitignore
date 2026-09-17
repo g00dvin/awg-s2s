@@ -4,5 +4,7 @@
 *.log
 *.new
 *.previous
+*.plan
+*.plan.draft
 build*/
 __pycache__/
