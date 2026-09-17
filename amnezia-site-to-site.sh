@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Version: 1.1.0 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

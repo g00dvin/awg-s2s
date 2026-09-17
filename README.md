@@ -96,16 +96,38 @@ Go и `/dev/net/tun` не требуются. Ubuntu PPA автоматичес�
 
 ## Быстрый запуск
 
-Получите проект удобным способом. Для приватного репозитория нужен
-авторизованный доступ к GitHub, например через настроенный `gh`:
+Репозиторий публичный: Git, GitHub CLI и авторизация не нужны. Скачайте скрипт
+через `curl` в отдельный каталог:
 
 ```bash
-gh repo clone g00dvin/awg-s2s
+mkdir -p awg-s2s
 cd awg-s2s
-bash ./amnezia-site-to-site.sh
+curl -fL --proto '=https' -o amnezia-site-to-site.sh https://raw.githubusercontent.com/g00dvin/awg-s2s/main/amnezia-site-to-site.sh
 ```
 
-Если проект уже скачан, достаточно последней команды из его каталога.
+Если вместо `curl` установлен `wget`, используйте:
+
+```bash
+mkdir -p awg-s2s
+cd awg-s2s
+wget --https-only -O amnezia-site-to-site.sh https://raw.githubusercontent.com/g00dvin/awg-s2s/main/amnezia-site-to-site.sh
+```
+
+После успешной загрузки просмотрите файл, проверьте синтаксис и запустите мастер:
+
+```bash
+less ./amnezia-site-to-site.sh
+bash -n ./amnezia-site-to-site.sh && bash ./amnezia-site-to-site.sh
+```
+
+Не запускайте скачивание напрямую через `curl | bash` или `wget | bash`.
+Проверка `bash -n` проверяет только синтаксис, а не безопасность кода.
+Если `less` отсутствует, просмотрите файл командой `more` или текстовым редактором.
+
+Ссылка ведёт на текущую ветку `main`, содержимое которой может обновляться.
+Версия самого скрипта указана в его заголовке; она отличается от версии AWG.
+Для воспроизводимой установки замените `main` в URL на проверенный полный
+SHA нужного коммита. Если файл уже скачан, повторная загрузка не обязательна.
 
 Выберите `1) Configure two servers from here (SSH controller)`.
 Запускайте controller **от обычного пользователя**, чтобы сохранить его
