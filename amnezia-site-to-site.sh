@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version: 1.2.0 (kernel-only AmneziaWG 3.1)
+# Version: 1.2.1 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -81,7 +81,7 @@ begin_plan() {
     [[ ! -f $PLAN_FILE.draft ]] || file=$PLAN_FILE.draft
     echo "Plan: $PLAN_FILE; interrupted input: $PLAN_FILE.draft"
     [[ -f $file ]] || return 0
-    ask "Saved $mode values found. Use them as defaults (yes/no)" yes
+    ask_validated "Saved $mode values found. Use them as defaults (yes/no)" yes valid_choice yes y no n
     [[ $ANSWER == yes || $ANSWER == y ]] || return 0
     {
         read -r marker || fail "Empty plan file"
@@ -96,12 +96,82 @@ begin_plan() {
     echo "Saved values loaded. Review or edit each field; type '-' to clear an optional field."
 }
 
-plan_ask() {
-    local key=$1 prompt=$2 default=${3:-}
-    ask "$prompt" "${PLAN[$key]:-$default}"
-    [[ $ANSWER != - ]] || ANSWER=
+ask_validated() {
+    local prompt=$1 default=$2 validator=$3
+    shift 3
+    while true; do
+        ask "$prompt" "$default"
+        [[ $ANSWER != - ]] || ANSWER=
+        if ( "$validator" "$ANSWER" "$@" ); then return; fi
+        echo "Please try again; previous fields are retained. Ctrl+C stops setup." >&2
+        default=
+    done
+}
+
+plan_ask_validated() {
+    local key=$1 prompt=$2 default=$3 validator=$4
+    shift 4
+    ask_validated "$prompt" "${PLAN[$key]:-$default}" "$validator" "$@"
     PLAN[$key]=$ANSWER
     save_plan "$PLAN_FILE.draft"
+}
+
+valid_choice() {
+    local value=$1 option
+    shift
+    for option in "$@"; do [[ $value != "$option" ]] || return 0; done
+    fail "Choose one of: $*"
+}
+
+valid_host() {
+    [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$ ]] || fail "Invalid SSH hostname/IP/alias"
+}
+
+valid_endpoint() {
+    [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || fail "Endpoint must be a hostname or IPv4 address"
+}
+
+valid_username() {
+    [[ -z $1 || $1 =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || fail "Invalid SSH username"
+}
+
+valid_port() {
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535)) || fail "Port must be 1..65535"
+}
+
+valid_optional_port() {
+    [[ -z $1 ]] || valid_port "$1"
+}
+
+valid_key_file() {
+    [[ -z $1 || -f $1 ]] || fail "SSH key file does not exist"
+}
+
+valid_jump() {
+    [[ -z $1 || $1 != -* && $1 != *[[:space:]]* ]] || fail "Invalid jump host"
+}
+
+valid_interface() {
+    [[ $1 =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ ]] || fail "Interface must start with a letter and contain 1..15 letters, digits or hyphens"
+}
+
+valid_peer_ip() {
+    valid_ip "$1"
+    [[ $1 != "$2" ]] || fail "Tunnel addresses must differ"
+}
+
+valid_optional_key() {
+    [[ -z $1 ]] || valid_key "$1"
+}
+
+valid_bundle_file() {
+    local -a values
+    [[ -f $1 ]] || fail "Bundle file does not exist"
+    mapfile -t values < "$1"
+    [[ ${#values[@]} -eq 8 && ${values[0]} == AWG-SITE-V3 ]] || fail "AWG-SITE-V3 bundle required"
+    valid_endpoint "${values[1]}"; valid_port "${values[2]}"
+    valid_ip "${values[3]}"; valid_peer_ip "${values[4]}" "${values[3]}"
+    valid_key "${values[5]}"; valid_key "${values[6]}"; valid_key "${values[7]}"
 }
 
 approve_plan() {
@@ -151,7 +221,7 @@ connection_details() {
     echo "1) SSH connection  2) This machine"
     local default_mode=1
     [[ ${PLAN[${node}_mode]:-} != local ]] || default_mode=2
-    plan_ask "${node}_mode" "Connection type" "$default_mode"
+    plan_ask_validated "${node}_mode" "Connection type" "$default_mode" valid_choice 1 2 ssh local
     case $ANSWER in
         1|ssh) NODE_MODE[$node]=ssh ;;
         2|local) NODE_MODE[$node]=local
@@ -160,23 +230,17 @@ connection_details() {
         *) fail "Choose SSH (1) or this machine (2)" ;;
     esac
     PLAN[${node}_mode]=ssh
-    plan_ask "${node}_host" "SSH hostname, IP address or SSH config alias"
-    [[ $ANSWER =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$ ]] || fail "Invalid SSH host"
+    plan_ask_validated "${node}_host" "SSH hostname, IP address or SSH config alias" "" valid_host
     NODE_HOST[$node]=$ANSWER
-    plan_ask "${node}_user" "SSH username (leave blank for SSH config; '-' clears saved value)"
-    [[ -z $ANSWER || $ANSWER =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || fail "Invalid SSH username"
+    plan_ask_validated "${node}_user" "SSH username (leave blank for SSH config; '-' clears saved value)" "" valid_username
     NODE_USER[$node]=$ANSWER
-    plan_ask "${node}_port" "SSH port (leave blank for SSH config/default 22; '-' clears saved value)"
-    [[ -z $ANSWER || $ANSWER =~ ^[1-9][0-9]{0,4}$ ]] || fail "Invalid SSH port"
-    [[ -z $ANSWER ]] || ((ANSWER <= 65535)) || fail "Invalid SSH port"
+    plan_ask_validated "${node}_port" "SSH port (leave blank for SSH config/default 22; '-' clears saved value)" "" valid_optional_port
     NODE_PORT[$node]=$ANSWER
     echo "Leave the key blank for your SSH agent, standard keys, or password login."
     echo "SSH itself asks for passwords/passphrases; this script never stores them."
-    plan_ask "${node}_key" "Private SSH key file (optional; '-' clears saved value)"
-    [[ -z $ANSWER || -f $ANSWER ]] || fail "SSH key file does not exist"
+    plan_ask_validated "${node}_key" "Private SSH key file (optional; '-' clears saved value)" "" valid_key_file
     NODE_KEY[$node]=$ANSWER
-    plan_ask "${node}_jump" "SSH jump host, e.g. user@jump.example:2222 (optional; '-' clears saved value)"
-    [[ -z $ANSWER || $ANSWER != -* && $ANSWER != *[[:space:]]* ]] || fail "Invalid jump host"
+    plan_ask_validated "${node}_jump" "SSH jump host, e.g. user@jump.example:2222 (optional; '-' clears saved value)" "" valid_jump
     NODE_JUMP[$node]=$ANSWER
 }
 
@@ -255,32 +319,32 @@ controller() {
     echo "SSH host-key checks remain enabled. Confirm unfamiliar host fingerprints with your administrator."
     connection_details listener
     connection_details connector
-    [[ ${NODE_MODE[listener]} != local || ${NODE_MODE[connector]} != local ]] || fail "Choose two different servers"
-    plan_ask interface "Tunnel interface name" "$INTERFACE"; INTERFACE=$ANSWER; set_paths
-    plan_ask endpoint "Listener's public hostname or IPv4 address (used for UDP, not SSH)"
+    while [[ ${NODE_MODE[listener]} == local && ${NODE_MODE[connector]} == local ]]; do
+        echo "Both ends cannot be this machine; choose another connector connection." >&2
+        connection_details connector
+    done
+    plan_ask_validated interface "Tunnel interface name" "$INTERFACE" valid_interface; INTERFACE=$ANSWER; set_paths
+    plan_ask_validated endpoint "Listener's public hostname or IPv4 address (used for UDP, not SSH)" "" valid_endpoint
     local endpoint=$ANSWER port listener_ip connector_ip node encoded bundle_encoded verified=1
-    [[ $endpoint =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || fail "Invalid UDP endpoint"
-    plan_ask port "Tunnel UDP port" 51830; port=$ANSWER
-    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || fail "Invalid UDP port"
-    plan_ask listener_ip "Listener tunnel IPv4 address" 10.203.77.1; listener_ip=$ANSWER; valid_ip "$listener_ip"
-    plan_ask connector_ip "Connector tunnel IPv4 address" 10.203.77.2; connector_ip=$ANSWER; valid_ip "$connector_ip"
-    [[ $listener_ip != "$connector_ip" ]] || fail "Tunnel addresses must differ"
+    plan_ask_validated port "Tunnel UDP port" 51830 valid_port; port=$ANSWER
+    plan_ask_validated listener_ip "Listener tunnel IPv4 address" 10.203.77.1 valid_ip; listener_ip=$ANSWER
+    plan_ask_validated connector_ip "Connector tunnel IPv4 address" 10.203.77.2 valid_peer_ip "$listener_ip"; connector_ip=$ANSWER
     echo "AllowedIPs on each server describes addresses reachable THROUGH THE OTHER SERVER."
     echo "Use comma-separated IPv4 CIDRs. The peer tunnel /32 is always included; default routes are refused."
     for node in listener connector; do
         if [[ $node == listener ]]; then
-            plan_ask "${node}_allowed" "Listener AllowedIPs: connector IP and networks behind connector" "$connector_ip/32"
+            plan_ask_validated "${node}_allowed" "Listener AllowedIPs: connector IP and networks behind connector" "$connector_ip/32" normalize_allowed_ips "$connector_ip" "$listener_ip"
             normalize_allowed_ips "$ANSWER" "$connector_ip" "$listener_ip"
         else
-            plan_ask "${node}_allowed" "Connector AllowedIPs: listener IP and networks behind listener" "$listener_ip/32"
+            plan_ask_validated "${node}_allowed" "Connector AllowedIPs: listener IP and networks behind listener" "$listener_ip/32" normalize_allowed_ips "$listener_ip" "$connector_ip"
             normalize_allowed_ips "$ANSWER" "$listener_ip" "$connector_ip"
         fi
         NODE_ALLOWED[$node]=$ALLOWED_IPS
+        if [[ $node == listener ]]; then warn_allowed_ips "$ALLOWED_IPS" "$listener_ip"; else warn_allowed_ips "$ALLOWED_IPS" "$connector_ip"; fi
         PLAN[${node}_allowed]=$ALLOWED_IPS
         echo "$node firewall: 1) Active UFW  2) Existing nftables input chain  3) Administrator-managed"
         echo "Automatic rules allow all local services from the peer tunnel IP; LAN rules remain manual."
-        plan_ask "${node}_firewall" "Choose firewall handling for $node" 3
-        [[ $ANSWER == 1 || $ANSWER == 2 || $ANSWER == 3 ]] || fail "Choose 1, 2 or 3"
+        plan_ask_validated "${node}_firewall" "Choose firewall handling for $node" 3 valid_choice 1 2 3
         NODE_FIREWALL[$node]=$ANSWER
     done
     echo
@@ -474,7 +538,7 @@ ask() {
 }
 
 confirm() {
-    ask "$1 (yes/no)" no
+    ask_validated "$1 (yes/no)" no valid_choice yes y no n
     [[ $ANSWER == yes || $ANSWER == y ]]
 }
 
@@ -529,14 +593,14 @@ wizard() {
     [[ -t 0 ]] || fail "Wizard requires an interactive terminal; use --help for automation commands"
     echo "AmneziaWG site-to-site setup on $(hostname) (this machine)"
     begin_plan wizard
-    plan_ask interface "Tunnel interface name" "$INTERFACE"
+    plan_ask_validated interface "Tunnel interface name" "$INTERFACE" valid_interface
     INTERFACE=$ANSWER
     set_paths
     echo "1) Install, configure and run"
     echo "2) Update AmneziaWG"
     echo "3) Show status"
     echo "4) Exit"
-    ask "Choose an action" 1
+    ask_validated "Choose an action" 1 valid_choice 1 2 3 4
     case $ANSWER in
         1) ;;
         2)
@@ -567,19 +631,19 @@ wizard() {
     else
         echo "1) Listener: public inbound UDP"
         echo "2) Connector: outbound UDP only"
-        plan_ask role "Server role" 2
+        plan_ask_validated role "Server role" 2 valid_choice 1 2
         case $ANSWER in
             1)
                 role=listener
-                plan_ask endpoint "Public listener hostname or IPv4 address"; endpoint=$ANSWER
-                plan_ask port "UDP listen port" 51830; port=$ANSWER
-                plan_ask local_ip "This server's tunnel IPv4 address" 10.203.77.1; local_ip=$ANSWER
-                plan_ask peer_ip "Connector's tunnel IPv4 address" 10.203.77.2; peer_ip=$ANSWER
+                plan_ask_validated endpoint "Public listener hostname or IPv4 address" "" valid_endpoint; endpoint=$ANSWER
+                plan_ask_validated port "UDP listen port" 51830 valid_port; port=$ANSWER
+                plan_ask_validated local_ip "This server's tunnel IPv4 address" 10.203.77.1 valid_ip; local_ip=$ANSWER
+                plan_ask_validated peer_ip "Connector's tunnel IPv4 address" 10.203.77.2 valid_peer_ip "$local_ip"; peer_ip=$ANSWER
                 ;;
             2)
                 role=connector
                 echo "Copy the confidential AWG 3.1 bundle from the listener through SSH first."
-                plan_ask bundle_path "Path to the listener bundle" ./listener-bundle.txt; bundle_path=$ANSWER
+                plan_ask_validated bundle_path "Path to the listener bundle" ./listener-bundle.txt valid_bundle_file; bundle_path=$ANSWER
                 [[ -f $bundle_path ]] || fail "Bundle file does not exist"
                 mapfile -t bundle < "$bundle_path"
                 [[ ${#bundle[@]} -eq 8 && ${bundle[0]} == AWG-SITE-V3 ]] || fail "AWG-SITE-V3 bundle required"
@@ -599,9 +663,10 @@ wizard() {
         default_allowed=${default_allowed:-$peer_ip/32}
     fi
     echo "AllowedIPs means addresses behind the OTHER server; LAN forwarding and firewall rules remain manual."
-    plan_ask local_allowed "AllowedIPs on this server (comma-separated IPv4 CIDRs)" "$default_allowed"
+    plan_ask_validated local_allowed "AllowedIPs on this server (IPv4 CIDRs separated by commas or spaces)" "$default_allowed" valid_wizard_allowed "$peer_ip" "$local_ip"
     normalize_allowed_ips "$ANSWER" "$peer_ip" "$local_ip"
     LOCAL_ALLOWED=$ALLOWED_IPS
+    warn_allowed_ips "$LOCAL_ALLOWED" "$local_ip"
     PLAN[local_allowed]=$LOCAL_ALLOWED
     PLAN[local_ip]=$local_ip PLAN[peer_ip]=$peer_ip PLAN[endpoint]=$endpoint PLAN[port]=$port
     if [[ $existing == 1 ]]; then
@@ -609,8 +674,7 @@ wizard() {
     fi
     echo "Firewall: 1) Active UFW  2) Existing nftables input chain  3) Administrator-managed"
     echo "Automatic rules allow all local services from the peer tunnel IP."
-    plan_ask local_firewall "Choose firewall handling" 3; firewall=$ANSWER
-    [[ $firewall == 1 || $firewall == 2 || $firewall == 3 ]] || fail "Choose 1, 2 or 3"
+    plan_ask_validated local_firewall "Choose firewall handling" 3 valid_choice 1 2 3; firewall=$ANSWER
 
     printf '\n%-22s | %s\n' Parameter "This server: $(hostname)"
     printf '%s\n' '-----------------------+--------------------------------------------'
@@ -632,7 +696,7 @@ wizard() {
     if [[ $role == listener ]]; then
         echo "Securely copy this confidential bundle to the connector: $STATE/bundle.txt"
         if [[ ! -f $STATE/peer.key ]]; then
-            ask "Paste the connector public key, or press Enter to finish later"
+            ask_validated "Paste the connector public key, or press Enter to finish later" "" valid_optional_key
             if [[ -z $ANSWER ]]; then
                 echo "Setup saved. Rerun wizard after the connector has generated its public key."
                 return
@@ -694,10 +758,9 @@ ipv4_number() {
 }
 
 normalize_allowed_ips() {
-    local input=$1 peer_ip=$2 local_ip=$3 cidr address prefix mask network local_number normalized
+    local input=$1 peer_ip=$2 local_ip=$3 cidr address prefix mask network normalized
     local -a entries
     valid_ip "$peer_ip"; valid_ip "$local_ip"
-    ipv4_number "$local_ip"; local_number=$IP_NUMBER
     input=${input//,/ }
     read -r -a entries <<< "$input"
     [[ ${#entries[@]} -gt 0 ]] || fail "AllowedIPs must not be empty"
@@ -710,10 +773,23 @@ normalize_allowed_ips() {
         ((prefix >= 1 && prefix <= 32)) || fail "AllowedIPs prefix must be 1..32; default routes are not supported"
         mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
         ipv4_number "$address"; network=$((IP_NUMBER & mask))
-        (( (local_number & mask) != network )) || fail "AllowedIPs $cidr contains this server's own tunnel IP $local_ip"
         printf -v normalized '%d.%d.%d.%d/%d' "$((network >> 24))" "$(((network >> 16) & 255))" "$(((network >> 8) & 255))" "$((network & 255))" "$prefix"
         [[ ,$ALLOWED_IPS, != *",$normalized,"* ]] || continue
         ALLOWED_IPS+=${ALLOWED_IPS:+,}$normalized
+    done
+}
+
+warn_allowed_ips() {
+    local input=$1 local_ip=$2 cidr address prefix mask network local_number
+    ipv4_number "$local_ip"; local_number=$IP_NUMBER
+    input=${input//,/ }
+    for cidr in $input; do
+        address=${cidr%/*} prefix=${cidr##*/}
+        mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
+        ipv4_number "$address"; network=$((IP_NUMBER & mask))
+        if (( (local_number & mask) == network )); then
+            echo "Warning: AllowedIPs $cidr includes this server's tunnel IP $local_ip; broad routes may redirect other local networks. Review existing routes before confirming." >&2
+        fi
     done
 }
 
@@ -724,6 +800,13 @@ check_saved_allowed_ips() {
     [[ -n $current ]] || current=${settings[1]}/32
     normalize_allowed_ips "${requested:-$current}" "${settings[1]}" "${settings[0]}"
     [[ $ALLOWED_IPS == "$current" ]] || fail "Existing AllowedIPs differs from confirmed plan; existing configuration is not overwritten. Use a new interface or coordinate changes on both servers"
+}
+
+valid_wizard_allowed() {
+    normalize_allowed_ips "$1" "$2" "$3"
+    if [[ -f $STATE/role ]]; then
+        AWG_ALLOWED_IPS=$1 check_saved_allowed_ips
+    fi
 }
 
 require_profile() {
@@ -957,7 +1040,7 @@ if [[ $# -eq 0 ]]; then
     [[ -t 0 ]] || fail "Interactive setup needs a terminal; use --help for automation commands"
     echo "1) Configure two servers from here (SSH controller)"
     echo "2) Configure only this server (local wizard)"
-    ask "Setup mode" 1
+    ask_validated "Setup mode" 1 valid_choice 1 2
     case $ANSWER in 1) set -- controller ;; 2) set -- wizard ;; *) fail "Choose 1 or 2" ;; esac
 fi
 if [[ $1 == controller ]]; then
