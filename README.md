@@ -1,233 +1,717 @@
-# AmneziaWG 3.1 kernel-only site-to-site setup
+# AmneziaWG 3.1: туннель между двумя серверами
 
-Connect two Debian/Ubuntu servers using one terminal. One server is the
-**listener**: it has a public hostname/IP and accepts inbound UDP. The other
-is the **connector**: it initiates outbound UDP and keeps the connection alive.
-Only the two tunnel IPv4 addresses are routed. Existing default routes, DNS,
-NAT and forwarding settings are retained.
+Скрипт настраивает защищённое соединение между Debian/Ubuntu-серверами через
+AmneziaWG 3.1. Используется **только модуль ядра Linux**: переход на реализацию
+в пользовательском пространстве отключён.
 
-## Start here
+Оба сервера можно настроить из одного терминала: с отдельной управляющей машины
+или с одного из концов туннеля. Один сервер должен принимать входящий UDP;
+второму достаточно исходящего UDP и получения ответов.
 
-Put `amnezia-site-to-site.sh` on a Linux workstation, management machine, or
-either server. The controller needs Bash, OpenSSH client and Linux coreutils.
-Run it as your normal user to retain your SSH keys, agent and configuration:
+> Это site-to-site соединение, а не VPN для перенаправления всего интернета.
+> По умолчанию через туннель доступны только адреса двух серверов.
+> Скрипт не меняет маршрут по умолчанию, DNS, NAT и пересылку пакетов.
+
+## Содержание
+
+- [Схема соединения](#схема-соединения)
+- [Требования и подготовка](#требования-и-подготовка)
+- [Быстрый запуск](#быстрый-запуск)
+- [Мастер настройки двух серверов](#мастер-настройки-двух-серверов)
+- [SSH: способы подключения](#ssh-способы-подключения)
+- [Межсетевой экран](#межсетевой-экран)
+- [SSH через туннель](#ssh-через-туннель)
+- [Локальный мастер и ручная настройка](#локальный-мастер-и-ручная-настройка)
+- [Справочник команд](#справочник-команд)
+- [Установка модуля и DKMS](#установка-модуля-и-dkms)
+- [Параметры AWG 3.1 и безопасность](#параметры-awg-31-и-безопасность)
+- [Обновление и откат](#обновление-и-откат)
+- [Файлы и службы](#файлы-и-службы)
+- [Диагностика](#диагностика)
+- [Остановка и удаление](#остановка-и-удаление)
+- [Проверки и ограничения](#проверки-и-ограничения)
+
+## Схема соединения
+
+| Роль | Назначение | Требования к сети |
+| --- | --- | --- |
+| **Listener** | Принимающая сторона | Публичный IPv4/домен и доступный входящий UDP-порт |
+| **Connector** | Инициирующая сторона | Исходящий UDP к listener и ответные пакеты; публичный адрес не обязателен |
+| **Controller** | Машина, с которой запускается настройка | SSH-путь к обоим серверам; один конец может быть текущей машиной |
+
+```text
+Управляющая машина ── SSH ── Listener
+                  └─ SSH ── Connector
+
+Connector ── исходящий UDP / AmneziaWG ──> Listener
+10.203.77.2 <──── двусторонний туннель ────> 10.203.77.1
+```
+
+После установления соединения оба сервера могут обращаться друг к другу по
+адресам туннеля. Например, listener сможет подключаться по SSH к connector,
+даже если connector не принимает публичные входящие UDP-соединения.
+
+**Для первоначальной настройки SSH-доступ всё равно необходим.** Если отдельная
+управляющая машина не может подключиться к connector, запустите скрипт на
+connector и выберите для него `This machine`, а для listener — SSH.
+Другой вариант — доступ через промежуточный SSH-сервер, то есть ProxyJump.
+
+Имена реальных серверов в скрипте не зашиты. Адреса, порты, пользователи и имя
+интерфейса выбираются при настройке.
+
+## Требования и подготовка
+
+### На каждом сервере
+
+- Debian или Ubuntu с systemd и возможностью загружать модули ядра.
+- Доступ `root` либо пользователь с правами выполнять необходимые команды через `sudo`.
+- Доступ к APT-репозиториям и GitHub по HTTPS.
+- Доступные заголовочные файлы именно **запущенной** версии ядра.
+- Достаточно места для исходников, сборки, DKMS и резервных копий.
+- Свободный UDP-порт и адреса туннеля без пересечений с существующими сетями.
+
+Установщик добавляет зависимости сборки, DKMS, kmod, iproute2 и headers.
+Go и `/dev/net/tun` не требуются. Ubuntu PPA автоматически не добавляется,
+в том числе на Debian. Обновление всего дистрибутива не выполняется.
+
+Контейнер без управления ядром хоста для автоматической установки не подходит.
+При Secure Boot может потребоваться регистрация ключа подписи DKMS через
+консоль машины. Скрипт не отключает Secure Boot и не обходит проверку подписи.
+
+### На управляющей машине
+
+Нужны Linux, Bash, клиент OpenSSH и стандартные Linux-утилиты. AWG здесь
+устанавливать не требуется, если эта машина не является концом туннеля.
+
+Перед запуском проверьте обычный SSH-вход на оба сервера. Знание SSH-пароля
+не означает наличие административных прав: отдельно проверьте `sudo`.
+
+### Памятка администратора
+
+1. Подготовьте доступ к консоли провайдера на случай потери сети.
+2. Не закрывайте рабочую SSH-сессию во время настройки firewall.
+3. Проверьте `ip route`: предложенные туннельные адреса могут быть заняты.
+4. Откройте выбранный входящий UDP-порт listener в панели провайдера.
+5. Если уже используется AWG, выделите окно обслуживания: модуль и инструменты общие для машины.
+
+## Быстрый запуск
+
+Получите проект удобным способом. Для приватного репозитория нужен
+авторизованный доступ к GitHub, например через настроенный `gh`:
 
 ```bash
+gh repo clone g00dvin/awg-s2s
+cd awg-s2s
 bash ./amnezia-site-to-site.sh
 ```
 
-Choose **Configure two servers from here**. The controller asks for:
+Если проект уже скачан, достаточно последней команды из его каталога.
 
-1. Each server's SSH hostname/IP or SSH configuration alias.
-2. SSH username, optional custom port, optional key file and optional jump host.
-3. The listener's public UDP endpoint, tunnel port and two tunnel addresses.
-4. A review of the plan before making changes.
-5. Firewall handling and confirmation that provider firewalls are ready.
+Выберите `1) Configure two servers from here (SSH controller)`.
+Запускайте controller **от обычного пользователя**, чтобы сохранить его
+SSH-ключи, агент и `~/.ssh/config`. На серверах скрипт использует `sudo`,
+где это необходимо.
 
-SSH uses your agent, existing keys, password login or a passphrase-protected
-key. SSH/sudo request passwords directly; the script does not store them.
-Blank username/port/key fields retain normal SSH configuration behavior.
-Enter actual key paths; shell shortcuts such as `~` are not expanded in
-prompts. SSH host-key verification remains enabled.
+Мастера пока англоязычные. Подтверждение — `yes` или `y`; по умолчанию
+ответ отрицательный. Можно остановиться и продолжить позже.
 
-Choose **This machine** for one server when running the controller on it.
-For example, the outbound-only connector can be local and reach the listener
-by SSH. A separate management machine needs an SSH path to both servers,
-possibly through jump hosts. Outbound-only UDP does not make inbound SSH
-possible. Each SSH user needs root or permission to run commands with sudo;
-sudo may ask for its password for each privileged action.
+## Мастер настройки двух серверов
 
-The controller checks that the connections have different machine IDs,
-uploads the script, bootstraps the kernel module/tools, exchanges public keys, prepares
-the selected host firewall, starts both services and checks connectivity.
-Private WireGuard keys remain on their own servers. The connector bundle
-contains the shared AWG 3.1 header-protection key and peer PSK and is transferred only
-through SSH without printing it. Temporary SSH connection
-sharing reduces repeated login prompts; connections are closed on exit.
+Явный запуск:
 
-Rerun with the same connection/tunnel settings after a pause or failure.
-Matching configurations and keys are retained; conflicting settings/peers
-are refused. Startup/ping failures retain configuration for troubleshooting.
-Final verification requires a recent handshake on both servers, independently
-of whether ICMP ping is permitted.
+```bash
+bash ./amnezia-site-to-site.sh controller
+```
 
-## Firewall choices
+### Подключение к серверам
 
-- **Active UFW:** adds persistent listener UDP, peer tunnel input and connector
-  outbound UDP rules. UFW is never enabled automatically, which could block SSH.
-- **Existing nftables input chain:** detects exactly one IPv4/inet input base
-  chain, inserts tagged rules, and creates a systemd service to restore them
-  at boot. Complex rulesets need administrator-managed rules. Active UFW
-  should use UFW mode.
-- **Administrator-managed:** leaves rules to your existing firewall management
-  and waits for confirmation before starting.
+Для listener и connector мастер отдельно запрашивает:
 
-Automatic rules allow the peer tunnel address to reach all local services.
-Choose manual handling to restrict access to specific services. You still need
-to allow listener UDP in the provider firewall, allow outbound UDP and its
-replies on the connector, and account for restrictive output/forwarding chains
-or additional firewall software. Provider control panels are not automated.
+1. `SSH connection` или `This machine`: удалённый сервер или текущая машина.
+2. IP/имя сервера либо псевдоним из SSH-конфигурации.
+3. SSH-пользователя.
+4. SSH-порт.
+5. Путь к приватному SSH-ключу, если нужен отдельный ключ.
+6. Промежуточный сервер для ProxyJump, если нужен.
 
-nftables mode creates `amnezia-site-firewall-INTERFACE.service` and makes the
-tunnel depend on it. It does not flush or replace tables. Rules are inserted
-before existing input rules. An `ip` family chain allows IPv4 UDP only: use
-an IPv4 listener endpoint. Restarting `nftables.service` also restarts the
-managed rules service. After a direct ruleset reload by another tool, restart
-the managed rules service. Avoid this mode if another tool owns that chain.
+Пустые поля пользователя/порта сохраняют обычное поведение SSH: настройки
+SSH-конфигурации либо стандартные значения. Пустой путь ключа допускает
+SSH-агент, стандартные ключи и вход по паролю.
 
-## SSH over the tunnel
+Выбирать текущую машину для обеих сторон нельзя. Controller сравнивает
+`/etc/machine-id`, чтобы не настроить оба конца на одной машине. У клонированных
+виртуальных машин этот идентификатор должен быть уникальным.
 
-The listener can reach the outbound-only connector at its tunnel address:
+### Параметры туннеля
+
+| Параметр | По умолчанию | Что проверить |
+| --- | --- | --- |
+| Интерфейс | `awg-site` | Не используется другим соединением |
+| UDP-порт | `51830` | Свободен и разрешён на listener |
+| IP listener | `10.203.77.1` | Не пересекается с существующими маршрутами |
+| IP connector | `10.203.77.2` | Отличается от первого и не пересекается с маршрутами |
+| Публичный UDP-endpoint | Вводится пользователем | Домен/IPv4 listener, не обязательно адрес SSH |
+
+Имя интерфейса начинается с латинской буквы; далее допустимы латинские буквы,
+цифры и дефисы. Максимум 15 символов. UDP-порт — от 1 до 65535.
+Вводимые IPv4-адреса не должны содержать ведущие нули в октетах.
+
+### Пять шагов применения
+
+1. **Доступ и установка.** Проверка SSH/root/sudo, загрузка копии скрипта,
+   сборка инструментов и установка DKMS-модуля.
+2. **Listener.** Создание ключей, профиля и конфиденциального пакета настроек.
+3. **Connector и обмен ключами.** Передача пакета через SSH, создание ключей
+   connector и добавление его публичного ключа на listener.
+4. **Firewall.** Выбор UFW, существующего nftables либо ручного управления.
+5. **Запуск и проверка.** Включение служб, ping и проверка недавнего handshake
+   на обеих сторонах. Проверяется также тип kernel-интерфейса.
+
+Приватные ключи WireGuard остаются на своих серверах. Общие секреты передаются
+через SSH без печати пакета в терминал. Временные разделяемые SSH-соединения
+закрываются при завершении controller.
+
+После паузы или ошибки повторите запуск с теми же параметрами. Выполненные
+шаги сохраняются; совпадающие профили и ключи не заменяются. Конфликтующие
+параметры или другой публичный ключ не перезаписываются автоматически.
+
+Если модуль установлен, но в памяти осталась другая сборка, мастер остановится.
+Запланируйте перезагрузку нужного сервера и повторите настройку.
+**Автоматической перезагрузки или выгрузки модуля нет.**
+
+## SSH: способы подключения
+
+Поддерживаются пароль, стандартные ключи, SSH-агент, отдельный ключ с парольной
+фразой или без неё, нестандартные порты, SSH-псевдонимы и ProxyJump.
+
+Пароли запрашиваются SSH/sudo и не сохраняются скриптом. При конфиденциальной
+передаче от пользователя без беспарольного sudo controller может отдельно
+запросить sudo-пароль; он передаётся через SSH и не записывается в файл.
+
+Путь ключа вводите полностью, например `/home/admin/.ssh/id_ed25519`.
+Сокращение `~` в ответах мастеру не разворачивается.
+
+Пример `~/.ssh/config` с условными адресами — замените все значения своими:
+
+```sshconfig
+Host vpn-listener
+    HostName listener.example.org
+    User admin
+    Port 2222
+    IdentityFile /home/admin/.ssh/id_ed25519
+
+Host vpn-connector
+    HostName connector.internal.example.org
+    User admin
+    Port 2202
+    ProxyJump vpn-listener
+```
+
+В мастере введите `vpn-listener` и `vpn-connector`, оставив дополнительные
+SSH-поля пустыми. ProxyJump работает только при наличии доступа от промежуточного
+сервера к SSH-серверу назначения.
+
+Проверка SSH-ключей хоста не отключается. При первом подключении сверьте
+отпечаток через доверенный канал. При неожиданном изменении ключа сначала
+выясните причину; не удаляйте запись `known_hosts` вслепую.
+
+## Межсетевой экран
+
+### Необходимые разрешения
+
+- Listener: входящий UDP на выбранный порт.
+- Connector: исходящий UDP к listener и ответный трафик.
+- Обе стороны: необходимые сервисы через туннель.
+- Для ping: соответствующий ICMP-трафик.
+
+Firewall провайдера и firewall ОС — разные уровни. Разрешение порта только
+на одном уровне не гарантирует доступность.
+
+### Активный UFW
+
+Скрипт работает только с уже активным UFW. Он не включает UFW автоматически,
+чтобы не заблокировать текущий SSH-доступ. Добавляются постоянные правила
+входящего UDP на listener, доступа от пира через туннель и исходящего UDP
+на connector.
+
+```bash
+sudo bash ./amnezia-site-to-site.sh firewall ufw
+sudo ufw status numbered
+```
+
+### Существующий nftables
+
+Нужны `nft`, `python3` и ровно одна входная базовая цепочка IPv4 в семействе
+`inet` или `ip`. При активном UFW выбирайте UFW. Сложные ruleset обслуживайте
+вручную.
+
+```bash
+sudo bash ./amnezia-site-to-site.sh firewall nft
+```
+
+Таблицы не очищаются. Добавляются правила с меткой и служба
+`amnezia-site-firewall-INTERFACE.service`, от которой зависит туннель.
+Правила вставляются перед существующими входными правилами и восстанавливаются
+при загрузке. Цепочка `ip` разрешает только IPv4 UDP: используйте IPv4-endpoint.
+
+После прямой перезагрузки ruleset внешним инструментом перезапустите службу
+правил. Связь с `nftables.service` настроена через `PartOf`; при обслуживании
+firewall проверяйте фактическое наличие правил. Не применяйте режим, если
+выбранной цепочкой управляет другой инструмент.
+
+### Ручное управление
+
+**Автоматические правила разрешают пиру все локальные сервисы через туннель,
+а не только SSH.** Для строгого ограничения доступа выберите
+`Administrator-managed` и разрешите только необходимые порты от туннельного `/32`.
+
+Controller не настраивает панель провайдера, сторонние firewall-системы и
+ограничения внешних output/forward-цепочек. Локальный wizard только просит
+подтвердить готовность firewall; его настройку выполняйте отдельно.
+
+## SSH через туннель
+
+С listener к connector:
 
 ```bash
 ssh -p 2222 admin@10.203.77.2
 ```
 
-Replace the port, user and address with your connector's settings. Its existing
-SSH service must listen on the tunnel IP (or all interfaces), and its firewall
-must allow that port. The script retains SSH daemon configuration and login keys.
+Замените IP, порт и пользователя своими значениями. SSH-сервер назначения
+должен слушать туннельный IP или все подходящие интерфейсы; firewall должен
+разрешать его TCP-порт. Способ аутентификации остаётся обычным.
 
-## Local wizard and automation
+Скрипт не меняет `sshd_config`, SSH-пароли и ключи входа. Перед закрытием
+публичного SSH проверьте несколько входов через туннель и подготовьте
+независимый доступ через консоль провайдера.
 
-To configure only the current machine:
+## Локальный мастер и ручная настройка
+
+Настройка только текущего сервера:
 
 ```bash
 sudo bash ./amnezia-site-to-site.sh wizard
 ```
 
-The wizard covers installation, configuration, secure bundle and public-key exchange,
-and startup. Pause while waiting for a peer key and resume later. Confirmation
-prompts default to no. The controller automates the public exchange instead.
+Мастер проводит через установку, выбор роли, обмен пакетом/публичным ключом и
+запуск. Можно закончить во время ожидания ключа и продолжить позже.
 
-Automation commands remain available:
+### Ручная последовательность
+
+**На listener:**
 
 ```bash
 sudo bash ./amnezia-site-to-site.sh install
-sudo bash ./amnezia-site-to-site.sh listener PUBLIC_ENDPOINT 51830 10.203.77.1 10.203.77.2
+sudo bash ./amnezia-site-to-site.sh listener listener.example.org 51830 10.203.77.1 10.203.77.2
+```
+
+Пакет находится в `/etc/amnezia/site-to-site/awg-site/bundle.txt`.
+Передайте его connector по доверенному защищённому каналу. Это root-only
+файл: обычный пользователь не сможет прочитать его через scp без дополнительных
+прав. Controller автоматизирует обмен и проще для такого сценария.
+
+Если SSH-вход root уже разрешён, **на connector**:
+
+```bash
+umask 077
+scp -P 2222 root@listener.example.org:/etc/amnezia/site-to-site/awg-site/bundle.txt ./listener-bundle.txt
+sudo bash ./amnezia-site-to-site.sh install
 sudo bash ./amnezia-site-to-site.sh connector ./listener-bundle.txt
+```
+
+Не включайте публичный root-вход специально ради примера. При доступе через
+обычного пользователя используйте controller с sudo.
+
+Команда connector выводит его публичный ключ. **На listener**:
+
+```bash
 sudo bash ./amnezia-site-to-site.sh peer CONNECTOR_PUBLIC_KEY
-sudo bash ./amnezia-site-to-site.sh firewall ufw
+```
+
+Вместо `CONNECTOR_PUBLIC_KEY` укажите точное полученное значение одной строкой.
+Подготовьте firewall. **На обоих серверах**:
+
+```bash
 sudo bash ./amnezia-site-to-site.sh up
 sudo bash ./amnezia-site-to-site.sh status
 sudo bash ./amnezia-site-to-site.sh verify
 ```
 
-Run listener/peer on the listener, connector on the connector, and install/up
-on both. Securely copy the confidential `bundle.txt` to the connector for local-mode setup.
-Controller commands `ensure-listener`/`ensure-connector` also accept matching
-existing configurations. Re-enrolling the same peer public key is safe.
+Проверяйте handshake после запуска обеих сторон. Копию пакета после настройки
+удалите либо храните как секрет с ограниченным доступом.
 
-Defaults are interface `awg-site`, UDP `51830`, and tunnel addresses
-`10.203.77.1`/`10.203.77.2`. These are suggestions; check for overlap with
-current networks. Choose another interface in the wizard or consistently set
-`AWG_INTERFACE` for command-line operations. No server names are built in.
+## Справочник команд
 
-## Installation and updates
+| Команда | Где | Действие |
+| --- | --- | --- |
+| Без аргументов | Управляющая машина / сервер | Выбор controller или wizard |
+| `controller` | Управляющая машина / сервер | Настройка двух серверов из одного терминала |
+| `wizard` | Каждый сервер | Локальный пошаговый мастер |
+| `install` | Оба сервера | Установка зависимостей, инструментов и DKMS |
+| `update` | Оба сервера | Сборка актуальных официальных исходников |
+| `kernel-check` | Оба сервера | Проверка версии и совпадения установленного/загруженного модуля |
+| `listener ENDPOINT [PORT [LOCAL_IP PEER_IP]]` | Listener | Создание listener и пакета |
+| `connector BUNDLE_FILE` | Connector | Создание connector из пакета |
+| `peer PUBLIC_KEY` | Listener | Регистрация публичного ключа connector |
+| `firewall ufw` / `firewall nft` | По необходимости | Настройка поддерживаемого локального firewall |
+| `up` | Оба сервера | Запуск и включение при загрузке |
+| `status` | Оба сервера | Состояние службы и интерфейса |
+| `verify` | Оба сервера | Проверка kernel-интерфейса и handshake не старше 180 секунд |
+| `--help` | Любая машина | Краткая справка без изменений системы |
 
-`install` bootstraps **kernel-only AWG 3.1** on Debian/Ubuntu systemd hosts.
-It installs distro build dependencies, DKMS and headers for the running kernel,
-then builds official kernel/tools sources at pinned commits. No Ubuntu PPA is
-added to Debian; Go and `/dev/net/tun` are not required. Root and internet access
-to APT and GitHub are required. Kernel builds may take several minutes.
+Внутренние команды: `ensure-listener`, `ensure-connector` проверяют совпадение
+профилей для controller; `kernel-interface-check` проверяет тип интерфейса;
+`firewall-apply`, `firewall-remove` используются службой nftables.
+Для обычной настройки вызывать их не требуется.
 
-DKMS sources live under `/usr/src/amneziawg-VERSION/` and automatically rebuild
-for future kernels when matching headers are installed. Tools are installed in
-`/usr/local/bin`; existing distro packages are not removed. Retained builds,
-source revisions and backups are recorded under this interface's state directory.
-Previously installed DKMS versions are retained for rollback. Before future
-kernel upgrades, have an administrator retire obsolete registrations with
-`dkms remove -m amneziawg -v OLD_VERSION --all`, keeping the selected version.
-Avoid mixing subsequent package-managed AWG upgrades with this source installer.
+### Другое имя интерфейса
 
-Installation fails clearly if running-kernel headers are unavailable or the module
-cannot load. Secure Boot may require enrolling the DKMS signing key through the
-machine/provider console; the script never disables Secure Boot. Containers
-need host-level module administration and are not bootstrapped automatically.
+В командной строке задавайте одинаковый `AWG_INTERFACE` во всех действиях:
 
-The installer **never unloads an existing module or stops existing tunnels**.
-If the installed module differs from the loaded module, installation reports
-that maintenance/reboot is needed and returns failure. Reboot, then rerun the
-same command/controller. Merely restarting a tunnel does not replace its module.
-Use `kernel-check` to verify the loaded and installed module match.
-Systemd checks this before startup and explicitly disables userspace fallback.
+```bash
+sudo env AWG_INTERFACE=awg-office bash ./amnezia-site-to-site.sh install
+sudo env AWG_INTERFACE=awg-office bash ./amnezia-site-to-site.sh status
+```
 
-### Configuration defaults
+В мастере имя выбирается интерактивно. Для другого соединения используйте
+другое имя, свободный порт и отдельные адреса. Модуль и инструменты при этом
+остаются общими для машины.
 
-New profiles use:
+## Установка модуля и DKMS
 
-- Separate private keys on each host; a random shared header-protection key
-  and a separate random per-peer preshared key, transferred only through SSH.
-- `S1 = S2 = S3 = S4 = 32`, with `H1 = 1`, `H2 = 2`, `H3 = 3`, `H4 = 4`.
-  Standard header values are recommended when header protection is enabled;
-  the message type is still hidden by header protection.
-- `ContentPaddingAddition = 16-64`, `RandomTrailers = off`,
-  `DisableCookies = off`; default protocol timers are retained.
-  Cookie replies retain DoS protection. Padding values are conservative project
-  defaults, not a guarantee of censorship resistance.
-- Kernel peer `AdvancedSecurity = on`, MTU 1280, and only the peer's tunnel /32.
-- Connector-only junk packets (`Jc = 4`, `Jmin = 40`, `Jmax = 70`) and
-  `PersistentKeepalive = 25`; the listener has no persistent keepalive.
+`install` использует зафиксированные в скрипте официальные commit SHA:
 
-All secret files are created with restrictive permissions. The confidential
-eight-line `AWG-SITE-V3` bundle contains both shared secrets. Older bundles and
-profiles are refused: choose a new interface and configure both servers together.
-Updates do not silently rewrite existing configuration or rotate keys.
-For stricter least privilege, select administrator-managed firewall handling
-and allow only required services from the peer; automatic firewall handling
-still permits all local services from the peer tunnel IP.
+| Компонент | Ревизия начальной установки |
+| --- | --- |
+| Модуль ядра | `4569c4c67f3a57414969260cafbbd04694fbaae0` |
+| Инструменты | `ee0f0a9aa34ff0a0da4b3433b9512781cfe02843` |
 
-`Table = auto` routes only the configured peer IPv4 `/32`, not internet traffic.
-`Table = on` is invalid; `off` requires manually installing the peer route.
+DKMS пересобирает внешний модуль при обновлении ядра. Исходники находятся
+в `/usr/src/amneziawg-VERSION/`. Для будущих ядер нужны соответствующие
+headers: наличие DKMS само по себе не гарантирует успешную пересборку.
 
-### Updates and recovery
+Инструменты устанавливаются в `/usr/local/bin`; существующие пакеты AWG
+не удаляются. Не смешивайте последующие APT-обновления AWG с этим установщиком
+без контроля администратора: они могут конкурировать за модуль.
 
-Update through the wizard or:
+Старые DKMS-регистрации сохраняются для отката. Перед будущими обновлениями ядра
+администратору следует проверить их и удалить ненужные, **сохранив выбранную
+рабочую версию**:
+
+```bash
+sudo dkms status -m amneziawg
+sudo dkms remove -m amneziawg -v OLD_VERSION --all
+```
+
+`OLD_VERSION` здесь и далее — заполнитель, не готовое значение.
+
+Установщик не выгружает модуль и не останавливает существующие туннели.
+Сравнивается `srcversion` установленного и загруженного модуля. При различии
+возвращается ошибка с рекомендацией перезагрузки в окно обслуживания.
+Перезапуск одной службы не заменяет модуль, используемый интерфейсами.
+
+Systemd выполняет `kernel-check` перед запуском и проверяет тип интерфейса
+после запуска. `WG_QUICK_USERSPACE_IMPLEMENTATION=/bin/false` отключает
+fallback на userspace.
+
+## Параметры AWG 3.1 и безопасность
+
+AWG маскирует транспортные характеристики и усложняет работу DPI, сохраняя
+криптографическую основу WireGuard. Изменение заголовков, размеров пакетов и
+таймингов не заменяет шифрование данных и не гарантирует обход любой блокировки.
+
+### Настройки новых профилей
+
+| Параметр | Значение | Назначение |
+| --- | --- | --- |
+| `HeaderProtectionKey` | Случайный общий ключ | Защита служебных частей пакетов; одинаковый на обеих сторонах |
+| `S1`, `S2`, `S3`, `S4` | По `32` | Префиксы, превышающие необходимые 12 байт для header protection |
+| `H1`, `H2`, `H3`, `H4` | `1`, `2`, `3`, `4` | Рекомендованные стандартные значения при защите заголовка |
+| `ContentPaddingAddition` | `16-64` | Дополнительное случайное заполнение пакетов |
+| `RandomTrailers` | `off` | Дополнительные хвосты отключены |
+| `DisableCookies` | `off` | Cookie replies не отключены; сохраняется механизм защиты от DoS |
+| `MTU` | `1280` | Консервативное стартовое значение |
+| `Table` | `auto` | Маршруты для указанных AllowedIPs |
+| `AllowedIPs` | IP другого конца с `/32` | Разрешённый адрес пира и направление трафика к нему |
+| `PresharedKey` | Отдельный случайный общий PSK | Дополнительный симметричный секрет пира |
+| `AdvancedSecurity` | `on` | Параметр пира kernel AWG |
+| `Jc` | Listener: `0`, connector: `4` | Junk-пакеты только на инициирующей стороне |
+| `Jmin`, `Jmax` | `40`, `70` | Диапазон размеров junk-пакетов |
+| `PersistentKeepalive` | Connector: `25` секунд | Поддержание состояния NAT/firewall при простое |
+
+Кастомные таймеры не задаются. Padding и MTU — стартовые настройки проекта,
+не универсальный оптимум. Проверяйте скорость и передачу крупных пакетов
+перед эксплуатацией.
+
+Стандартные H-значения не отключают `HeaderProtectionKey`: тип сообщения
+остаётся скрыт защитой заголовка. При самостоятельном включении
+`RandomTrailers` рекомендуется одинаковый размер S1–S4; здесь он уже одинаковый.
+
+`Table = on` — недопустимое значение awg-quick. `auto` не означает перенаправление
+всего интернета: профиль содержит только маршрут к пиру `/32`.
+При `Table = off` этот маршрут требуется установить вручную.
+
+### Ключи и пакет подключения
+
+У каждого интерфейса отдельная пара WireGuard-ключей. Приватный ключ не
+копируется на другой сервер. Header-protection key и PSK — разные общие секреты.
+
+Конфиденциальный `bundle.txt` содержит восемь строк:
+
+1. Маркер `AWG-SITE-V3`.
+2. Публичный домен/IPv4 listener.
+3. UDP-порт.
+4. Туннельный IPv4 listener.
+5. Туннельный IPv4 connector.
+6. Публичный WireGuard-ключ listener.
+7. Общий HeaderProtectionKey.
+8. Общий PSK пира.
+
+**Пакет и конфигурация содержат секреты.** Не публикуйте их в Git, issue,
+чатах и логах. `awg showconf` и `awg show ... dump` могут раскрывать секретные
+ключи: не публикуйте вывод без проверки и удаления секретов.
+
+Скрипт использует `umask 077`; новые секретные файлы доступны только владельцу.
+Каталоги состояния создаются с правами `0700`. Защищайте резервные копии
+и передавайте секреты только через доверенный защищённый канал.
+
+Старые пакеты/профили автоматически не мигрируются. Для перехода выберите
+новый интерфейс и настройте **обе стороны вместе**, затем выведите старый
+туннель из эксплуатации. Обновление программы само по себе не меняет ключи
+и параметры старого профиля.
+
+## Обновление и откат
+
+### Обновление
+
+Wizard предлагает `Update AmneziaWG`. Командная строка на каждом сервере:
 
 ```bash
 sudo bash ./amnezia-site-to-site.sh update
 sudo bash ./amnezia-site-to-site.sh kernel-check
 ```
 
-Updates resolve current official upstream `master` commits for both kernel and
-tools, validate that the kernel identifies as 3.1, build before replacing
-installed components, and retain previous tools/module and DKMS registrations.
-Master commits are not necessarily tagged releases. GitHub API rate limits or
-download failures abort the action; no unverified fallback installer is used.
+`update` получает текущие commit SHA официальных веток `master` модуля и
+инструментов, проверяет принадлежность модуля к 3.1, собирает компоненты
+и сохраняет копии прежних инструментов/модуля. Это не обязательно
+тегированный релиз: master может быть новее опубликованных релизов.
 
-Updates affect shared module/tools on the host, including other AWG tunnels.
-Plan a maintenance window and keep console access available. If a reboot is
-required, perform it before restarting services. The wizard offers to restart
-only this project's tunnel after `kernel-check` succeeds. Existing keys,
-addresses, routes and profiles are retained.
+Ограничения API GitHub и ошибки загрузки прерывают действие. Перехода
+на сторонний непроверенный установщик нет.
 
-For source rollback, an administrator can reinstall a retained earlier DKMS
-registration for the running kernel with `dkms install --force -m amneziawg
--v OLD_VERSION -k KERNEL_RELEASE`, restore backed-up tools to `/usr/local/bin`,
-and reboot to load the matching module. Module backups are recovery artifacts,
-not an automatic rollback system. Verify handshakes and connectivity afterward.
+Обновление затрагивает **все AWG-туннели машины**, поскольку модуль и
+инструменты общие. Оно не переписывает профили, не ротирует ключи и не
+выгружает модуль. Скрипт явно не перезапускает службы при update,
+но APT во время установки зависимостей может выполнять системные hooks.
 
-## Administrator notes
+Рекомендуемый порядок:
 
-For the default interface:
+1. Подготовьте окно обслуживания, консоль и резервную копию.
+2. Выполните update на одной стороне.
+3. При необходимости перезагрузите сервер в согласованное время.
+4. Повторите kernel-check и после успеха перезапустите нужные службы.
+5. Проверьте соединение и повторите процедуру для второй стороны.
 
 ```bash
-sudo systemctl status amnezia-site-awg-site
-sudo journalctl -u amnezia-site-awg-site -n 50
-sudo systemctl disable --now amnezia-site-awg-site
+sudo systemctl restart amnezia-site-awg-site.service
+sudo bash ./amnezia-site-to-site.sh verify
+ping -c 3 10.203.77.2
 ```
 
-Configuration: `/etc/amnezia/amneziawg/awg-site.conf`. Root-only keys, settings,
-confidential bundle and retained builds: `/etc/amnezia/site-to-site/awg-site/`.
-Stopping the tunnel retains files and firewall rules. To remove managed
-nftables rules, disable/stop `amnezia-site-firewall-awg-site.service`; remove
-UFW rules through normal UFW administration.
+Адрес ping выбирайте по роли. Wizard отдельно предлагает перезапуск только
+службы этого профиля после успешного kernel-check; другие службы обслуживаются
+отдельно. Обновление загрузочного модуля может потребовать повторного запуска
+update после перезагрузки для завершения проверки.
 
-For operators learning Linux, use the controller, SSH aliases for repeat
-deployments, plan review and handshake verification. Keep a provider console
-available for firewall administration. Useful future additions include saved
-non-secret connection profiles, a diagnostics report, scoped service access
-and a cleanup wizard.
+### Откат для администратора
 
-References: [AWG 3.1 configuration and security](https://docs.amnezia.org/documentation/amnezia-wg/),
-[kernel module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
-and [tools](https://github.com/amnezia-vpn/amneziawg-tools).
+Автоматического отката нет. Сохранённые исходники DKMS и резервные копии —
+материалы для восстановления, а не гарантия успешного возврата.
+
+Проверьте старую версию и целевое ядро, затем при необходимости:
+
+```bash
+sudo dkms install --force -m amneziawg -v OLD_VERSION -k KERNEL_RELEASE
+```
+
+Восстановите подходящие `awg` и `awg-quick` из `backup/` в `/usr/local/bin`,
+перезагрузите машину для загрузки совпадающего модуля и проверьте трафик.
+Не копируйте модуль от другого ядра. Возврат к пакетной установке зависит
+от доступных версий и правил соответствующего репозитория.
+
+## Файлы и службы
+
+Для стандартного интерфейса `awg-site`:
+
+| Путь / служба | Назначение |
+| --- | --- |
+| `/etc/amnezia/amneziawg/awg-site.conf` | Конфигурация AWG с секретами |
+| `/etc/amnezia/site-to-site/awg-site/` | Состояние профиля, ключи, пакет и сборки |
+| `private.key`, `public.key`, `header.key`, `preshared.key` | Файлы ключей в каталоге состояния |
+| `peer.key` | Зарегистрированный публичный ключ connector на listener |
+| `profile`, `role`, `settings` | Формат профиля, роль и параметры |
+| `bundle.txt` | Конфиденциальный пакет на listener |
+| `incoming-bundle.txt` | Полученный controller пакет на connector |
+| `build.XXXXXXXX/` | Сборки, staging, запись ревизий и backup |
+| `/usr/src/amneziawg-VERSION/` | Исходники DKMS |
+| `/usr/local/share/amnezia-site-source-versions` | Общая запись установленных ревизий |
+| `/usr/local/lib/amnezia-site-to-site.sh` | Системная копия скрипта для служб |
+| `amnezia-site-awg-site.service` | Служба туннеля |
+| `amnezia-site-firewall-awg-site.service` | Служба правил nftables |
+
+При другом имени интерфейса замените `awg-site` в соответствующих путях/службах.
+
+```bash
+sudo systemctl status amnezia-site-awg-site.service
+sudo journalctl -u amnezia-site-awg-site.service -n 50 --no-pager
+sudo systemctl stop amnezia-site-awg-site.service
+sudo systemctl start amnezia-site-awg-site.service
+sudo systemctl restart amnezia-site-awg-site.service
+sudo awg show awg-site
+ip -brief address show dev awg-site
+ip route get 10.203.77.2
+```
+
+`up` включает запуск при загрузке. Остановка не удаляет конфигурацию и
+firewall-правила. Активная служба не доказывает наличие связи: проверяйте
+handshake и реальную доступность нужного сервиса.
+
+## Диагностика
+
+### Не найдены заголовочные файлы ядра
+
+```bash
+uname -r
+ls -ld /lib/modules/$(uname -r)/build
+```
+
+Проверьте APT и headers именно запущенного ядра. Для старого или нестандартного
+ядра может потребоваться установка поддерживаемого ядра дистрибутива и
+перезагрузка. Скрипт не выполняет full-upgrade автоматически.
+
+### Модуль не загружается или не совпадает
+
+```bash
+sudo bash ./amnezia-site-to-site.sh kernel-check
+sudo dkms status -m amneziawg
+sudo modinfo amneziawg
+sudo journalctl -k -n 100 --no-pager
+```
+
+Посмотрите ошибки сборки в `/var/lib/dkms/amneziawg/VERSION/` и состояние
+Secure Boot. При различии установленного/загруженного модуля обычно нужна
+перезагрузка. Не выполняйте `modprobe -r` вслепую при наличии других туннелей.
+
+### Служба активна, но handshake отсутствует
+
+1. Проверьте запуск обеих сторон.
+2. Проверьте публичный UDP-endpoint/порт: это не SSH-порт.
+3. Проверьте host firewall и firewall провайдера.
+4. Сравните публичный ключ интерфейса с PublicKey пира на другой стороне.
+5. Проверьте совпадение общих секретов и AWG-параметров, не публикуя их.
+6. Убедитесь, что connector отправляет UDP и получает ответы.
+
+```bash
+sudo awg show awg-site public-key
+sudo awg show awg-site latest-handshakes
+sudo awg show awg-site transfer
+sudo journalctl -u amnezia-site-awg-site.service -n 50 --no-pager
+```
+
+`verify` требует handshake за последние 180 секунд. На простаивающем
+соединении без keepalive сначала создайте трафик. Штатный connector использует
+keepalive для сохранения доступности через NAT/firewall.
+
+### Handshake есть, но ping или SSH не работают
+
+Проверьте маршрут, AllowedIPs, разрешения ICMP/TCP и прослушиваемый SSH-порт.
+Запрет ICMP не доказывает неисправность туннеля: controller проверяет
+handshake отдельно. Успешный handshake не гарантирует доступность приложения.
+
+### Исчезли nftables-правила после reload
+
+При перезагрузке ruleset внешним инструментом:
+
+```bash
+sudo systemctl restart amnezia-site-firewall-awg-site.service
+sudo systemctl status amnezia-site-firewall-awg-site.service
+```
+
+Не используйте одновременно несколько независимых менеджеров одной цепочки.
+
+### Controller отказывается продолжать
+
+Проверьте, не указывают ли оба подключения на одну машину, совпадают ли
+параметры существующего профиля и не используется ли старый пакет.
+Повторная регистрация того же ключа безопасна; другой ключ не считается
+неявной заменой. Для нового соединения создайте новый профиль.
+
+## Остановка и удаление
+
+### Отключить без удаления
+
+```bash
+sudo systemctl disable --now amnezia-site-awg-site.service
+```
+
+Ключи/профиль сохранятся. Для повторного включения используйте `up`.
+
+### Удалить профиль
+
+Автоматического мастера удаления нет. Убедитесь, что доступ к серверу идёт
+**не через удаляемый туннель**, и сохраните нужные резервные копии.
+
+1. Остановите и отключите службу туннеля.
+2. В nftables-режиме остановите/отключите службу правил, пока её скрипт и
+   файлы состояния доступны: она удаляет правила с меткой данного профиля.
+3. Для UFW вручную удалите только соответствующие правила через
+   `ufw status numbered` и `ufw delete`; номера после удаления меняются.
+4. После проверки путей удалите unit-файлы данного профиля, его drop-in-каталог,
+   конфигурацию AWG и каталог состояния.
+5. Выполните `systemctl daemon-reload` и проверьте отсутствие маршрутов/правил профиля.
+
+Для nftables-режима второй шаг:
+
+```bash
+sudo systemctl disable --now amnezia-site-firewall-awg-site.service
+```
+
+Не удаляйте общие инструменты, системную копию скрипта и DKMS-модуль,
+если они нужны другим профилям/AWG-туннелям. Удаление секретного файла
+не гарантирует стирание его копий из snapshots, backups и SSD.
+
+## Проверки и ограничения
+
+17 сентября 2026 года выполнена живая проверка между Debian 12 с ядром
+`6.1.0-53-amd64` и Ubuntu 24.04 с ядром `6.8.0-139-generic`:
+
+- Инструменты и DKMS-модуль установились на обеих сторонах.
+- Службы запустили kernel-интерфейсы с новыми настройками.
+- Handshake и двусторонний ping прошли без потерь, около 54 мс в тестовой сети.
+- Повторная установка и проверка совпадающих профилей прошли успешно.
+- Неверный header-protection key блокировал трафик; верный восстанавливал связь.
+- Существующий туннель удалённого сервера оставался работоспособным.
+- Тестовые интерфейсы, конфигурация, службы и правила firewall удалены.
+
+Это не проверка всех версий Debian/Ubuntu, Secure Boot, всех SSH-сценариев,
+controller целиком или будущих upstream-обновлений.
+
+Ограничения:
+
+- Только IPv4 внутри туннеля и один пир на профиль.
+- Нет автоматического LAN-routing, NAT, full-tunnel и IPv6-профилей.
+- Нет настройки SSH-сервера, firewall провайдера и регистрации Secure Boot-ключа.
+- Автоматический nftables требует простого ruleset; автоматические разрешения широкие.
+- Нет автоматической миграции, ротации ключей, отката и удаления.
+- Нет сохранения SSH-профилей controller; используйте SSH-конфигурацию.
+
+## Официальные материалы
+
+- [AmneziaWG: параметры AWG 3.1 и безопасность](https://docs.amnezia.org/documentation/amnezia-wg/).
+- [Модуль ядра AmneziaWG](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module).
+- [Инструменты awg и awg-quick](https://github.com/amnezia-vpn/amneziawg-tools).
+- [WireGuard: настройка и keepalive](https://www.wireguard.com/quickstart/).
+
+Перед самостоятельным изменением параметров сверяйтесь с документацией
+совместимых версий на обоих концах. Включение всех опций не означает
+автоматического улучшения безопасности или стабильности.
