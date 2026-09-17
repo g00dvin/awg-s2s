@@ -1,0 +1,8 @@
+*.key
+*.conf
+*bundle*.txt
+*.log
+*.new
+*.previous
+build*/
+__pycache__/
