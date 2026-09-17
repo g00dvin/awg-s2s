@@ -5,7 +5,7 @@ export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 
 INTERFACE=${AWG_INTERFACE:-awg-site}
-GO_REV=b5928efb6ca19f0153958460c3d141f04abc5c2e
+KERNEL_REV=4569c4c67f3a57414969260cafbbd04694fbaae0
 TOOLS_REV=ee0f0a9aa34ff0a0da4b3433b9512781cfe02843
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 
@@ -17,6 +17,7 @@ Usage (run with sudo/root):
   bash amnezia-site-to-site.sh wizard
   bash amnezia-site-to-site.sh install
   bash amnezia-site-to-site.sh update
+  bash amnezia-site-to-site.sh kernel-check
   bash amnezia-site-to-site.sh listener ENDPOINT [PORT [LOCAL_IP PEER_IP]]
   bash amnezia-site-to-site.sh connector BUNDLE_FILE
   bash amnezia-site-to-site.sh peer PUBLIC_KEY
@@ -31,7 +32,8 @@ listener saves a confidential AWG 3 bundle; connector prints its public key.
 Run peer on the listener with that key, then up on both servers.
 Only the peer's tunnel IPv4 /32 is routed. Firewall rules are managed separately.
 Run without arguments to launch the step-by-step wizard.
-update preserves configuration and keys; service restarts are manual.
+Kernel-only AWG 3.1: install builds tools and a persistent DKMS module.
+update preserves configuration and keys; loaded modules are never unloaded.
 controller runs on either server or a separate Linux workstation (no local root
 needed unless configuring this machine). SSH supports passwords, keys, agents,
 custom ports, SSH config aliases and ProxyJump. Remote users need root or sudo.
@@ -384,6 +386,7 @@ EOF
 }
 
 verify_tunnel() {
+    kernel_interface_check
     local now
     now=$(date +%s)
     if ! awg show "$INTERFACE" latest-handshakes | awk -v now="$now" '$2 > 0 && now - $2 <= 180 {found=1} END {exit !found}'; then
@@ -425,7 +428,7 @@ wizard() {
             echo "APT may run package-maintenance hooks. Plan a maintenance window. Keys are retained."
             if confirm "Proceed with the update"; then
                 run_command update
-                if [[ -f $SERVICE ]] && confirm "Restart only $UNIT now (brief interruption)"; then
+                if [[ -f $SERVICE ]] && run_command kernel-check && confirm "Restart only $UNIT now (brief interruption)"; then
                     systemctl restart "$UNIT"
                     show_status
                 fi
@@ -438,7 +441,7 @@ wizard() {
     esac
 
     echo "Step 1/4: Install or check AmneziaWG"
-    echo "Existing tools are retained. A clean install downloads and builds upstream sources."
+    echo "Build AWG 3.1 tools and a DKMS kernel module; matching source builds are retained."
     if ! confirm "Continue with installation/check"; then return; fi
     run_command install
 
@@ -469,7 +472,7 @@ wizard() {
     fi
 
     echo "Step 3/4: Exchange public keys and review firewall"
-    [[ -f $STATE/header.key ]] && grep -q '^HeaderProtectionKey = ' "$CONFIG" || fail "This is a legacy profile; choose a new interface for AWG 3 setup"
+    require_profile
     if [[ $(cat "$STATE/role") == listener ]]; then
         echo "Securely copy this confidential AWG 3 bundle to the connector: $STATE/bundle.txt"
         if [[ ! -f $STATE/peer.key ]]; then
@@ -525,106 +528,124 @@ valid_key() {
     [[ $(printf '%s' "$1" | base64 -d | wc -c) -eq 32 ]] || fail "Invalid public key length"
 }
 
+require_profile() {
+    [[ -f $STATE/header.key && -f $STATE/preshared.key && -f $STATE/profile && $(cat "$STATE/profile") == AWG-SITE-V3 ]] || fail "Legacy profile: choose a new interface and configure both ends together for AWG 3.1; existing keys/configuration are not overwritten"
+}
+
+kernel_check() {
+    command -v modprobe >/dev/null || fail "Run install first (modprobe is missing)"
+    modprobe amneziawg || fail "Cannot load the kernel module. Check Secure Boot signing, kernel headers and journalctl -k; userspace fallback is disabled"
+    local installed loaded
+    installed=$(modinfo -F srcversion amneziawg)
+    loaded=$(cat /sys/module/amneziawg/srcversion)
+    [[ -n $installed && $installed == "$loaded" ]] || fail "Installed and loaded AmneziaWG modules differ. Reboot during maintenance, then rerun; restarting a tunnel alone does not replace the module"
+    [[ $(modinfo -F version amneziawg) == 3.1.* ]] || fail "AWG 3.1 kernel module required; run install"
+    echo "AWG 3.1 kernel module loaded and matches the installed build."
+}
+
+kernel_interface_check() {
+    ip -j -d link show dev "$INTERFACE" | python3 -c '
+import json, sys
+links = json.load(sys.stdin)
+if not links or links[0].get("linkinfo", {}).get("info_kind") != "amneziawg":
+    raise SystemExit("Expected a kernel AmneziaWG interface; userspace interfaces are refused")
+'
+}
+
 install_tools() {
     local mode=${1:-install}
     [[ -f /etc/os-release ]] || fail "Cannot identify operating system"
     . /etc/os-release
     [[ $ID == debian || $ID == ubuntu ]] || fail "Only Debian and Ubuntu are supported"
-    if [[ $mode == install ]] && command -v awg >/dev/null && command -v awg-quick >/dev/null; then
-        echo "Existing AmneziaWG tools retained."
+    [[ -d /run/systemd/system ]] || fail "A systemd host is required; containers need host-level module administration"
+    local kernel_release build_dir module_version source_dir binary revision component source_repo protocol_version
+    kernel_release=$(uname -r)
+    [[ $kernel_release =~ ^[a-zA-Z0-9._+-]+$ ]] || fail "Invalid kernel release"
+    install -d -m 700 "$STATE"
+    apt-get update
+    apt-get install -y ca-certificates curl python3 build-essential dkms kmod iproute2 "linux-headers-$kernel_release"
+    [[ -d /lib/modules/$kernel_release/build ]] || fail "Running-kernel headers unavailable; install a supported distro kernel and reboot first"
+    build_dir=$(mktemp -d "$STATE/build.XXXXXXXX")
+    if [[ $mode == update ]]; then
+        for component in kernel tools; do
+            if [[ $component == kernel ]]; then
+                source_repo=amneziawg-linux-kernel-module
+            else
+                source_repo=amneziawg-tools
+            fi
+            curl -fsSL "https://api.github.com/repos/amnezia-vpn/$source_repo/commits/master" -o "$build_dir/$component-commit.json"
+            revision=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$build_dir/$component-commit.json")
+            [[ $revision =~ ^[a-f0-9]{40}$ ]] || fail "Invalid upstream source revision"
+            if [[ $component == kernel ]]; then KERNEL_REV=$revision; else TOOLS_REV=$revision; fi
+        done
+    fi
+    module_version=3.1.20260812-${KERNEL_REV:0:12}
+    if [[ $mode == install && -f /usr/local/share/amnezia-site-source-versions ]] &&
+        grep -Fxq "kernel=$KERNEL_REV" /usr/local/share/amnezia-site-source-versions &&
+        grep -Fxq "tools=$TOOLS_REV" /usr/local/share/amnezia-site-source-versions &&
+        [[ -x /usr/local/bin/awg && -x /usr/local/bin/awg-quick ]] &&
+        dkms status -m amneziawg -v "$module_version" -k "$kernel_release" | grep -q ': installed'; then
+        kernel_check
         return
     fi
-    [[ -c /dev/net/tun ]] || fail "/dev/net/tun is required for userspace AmneziaWG"
-    apt-get update
-    apt-get install -y ca-certificates curl python3 build-essential pkg-config iproute2
-    local build_dir architecture checksum go_version
-    build_dir=$(mktemp -d "$STATE/build.XXXXXXXX")
-    case $(uname -m) in
-        x86_64) architecture=amd64 ;;
-        aarch64|arm64) architecture=arm64 ;;
-        *) fail "Automatic installation supports amd64 and arm64 only" ;;
-    esac
-    curl -fsSL 'https://go.dev/dl/?mode=json&include=all' -o "$build_dir/go.json"
-    read -r go_version checksum < <(python3 - "$build_dir/go.json" "$architecture" <<'PY'
-import json
-import sys
-with open(sys.argv[1]) as source:
-    releases = json.load(source)
-for release in releases:
-    if release['stable']:
-        for archive in release['files']:
-            if archive['os'] == 'linux' and archive['arch'] == sys.argv[2] and archive['kind'] == 'archive':
-                print(release['version'], archive['sha256'])
-                sys.exit(0)
-raise SystemExit('Go archive checksum not found')
-PY
-    )
-    [[ $go_version =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ && $checksum =~ ^[a-f0-9]{64}$ ]] || fail "Invalid Go download manifest"
-    if [[ $mode == update ]]; then
-        curl -fsSL https://api.github.com/repos/amnezia-vpn/amneziawg-go/commits/master -o "$build_dir/go-commit.json"
-        curl -fsSL https://api.github.com/repos/amnezia-vpn/amneziawg-tools/commits/master -o "$build_dir/tools-commit.json"
-        GO_REV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$build_dir/go-commit.json")
-        TOOLS_REV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$build_dir/tools-commit.json")
-        [[ $GO_REV =~ ^[a-f0-9]{40}$ && $TOOLS_REV =~ ^[a-f0-9]{40}$ ]] || fail "Invalid upstream source revision"
-    fi
-    echo "Building Go implementation $GO_REV and tools $TOOLS_REV with $go_version"
-    curl -fsSL "https://go.dev/dl/$go_version.linux-$architecture.tar.gz" -o "$build_dir/go.tar.gz"
-    printf '%s  %s\n' "$checksum" "$build_dir/go.tar.gz" | sha256sum -c -
-    tar -xzf "$build_dir/go.tar.gz" -C "$build_dir"
-    curl -fsSL "https://codeload.github.com/amnezia-vpn/amneziawg-go/tar.gz/$GO_REV" -o "$build_dir/awg-go.tar.gz"
+    echo "Building AWG 3.1 kernel $KERNEL_REV and tools $TOOLS_REV"
+    curl -fsSL "https://codeload.github.com/amnezia-vpn/amneziawg-linux-kernel-module/tar.gz/$KERNEL_REV" -o "$build_dir/kernel.tar.gz"
     curl -fsSL "https://codeload.github.com/amnezia-vpn/amneziawg-tools/tar.gz/$TOOLS_REV" -o "$build_dir/tools.tar.gz"
-    tar -xzf "$build_dir/awg-go.tar.gz" -C "$build_dir"
+    tar -xzf "$build_dir/kernel.tar.gz" -C "$build_dir"
     tar -xzf "$build_dir/tools.tar.gz" -C "$build_dir"
-    (
-        cd "$build_dir/amneziawg-go-$GO_REV"
-        GOTOOLCHAIN=local GOCACHE="$build_dir/go-cache" GOPATH="$build_dir/go-path" \
-            "$build_dir/go/bin/go" build -o "$build_dir/amneziawg-go" .
-    )
+    protocol_version=$(sed -n 's/^#define WIREGUARD_VERSION "\(3\.1\.[0-9]*\)"$/\1/p' "$build_dir/amneziawg-linux-kernel-module-$KERNEL_REV/src/version.h")
+    [[ $protocol_version =~ ^3\.1\.[0-9]+$ ]] || fail "Upstream is not a supported AWG 3.1 build; review before upgrading"
+    module_version=$protocol_version-${KERNEL_REV:0:12}
+    source_dir=/usr/src/amneziawg-$module_version
+    if [[ ! -d $source_dir ]]; then
+        cp -a "$build_dir/amneziawg-linux-kernel-module-$KERNEL_REV/src" "$source_dir"
+        cat > "$source_dir/dkms.conf" <<EOF
+PACKAGE_NAME="amneziawg"
+PACKAGE_VERSION="$module_version"
+AUTOINSTALL="yes"
+BUILT_MODULE_NAME[0]="amneziawg"
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+MAKE[0]="make KERNELRELEASE=\$kernelver WIREGUARD_VERSION=$protocol_version"
+CLEAN="make clean KERNELRELEASE=\$kernelver"
+EOF
+    fi
+    if [[ -z $(dkms status -m amneziawg -v "$module_version") ]]; then
+        dkms add -m amneziawg -v "$module_version"
+    fi
+    if ! dkms status -m amneziawg -v "$module_version" -k "$kernel_release" | grep -Eq ': (built|installed)'; then
+        dkms build -m amneziawg -v "$module_version" -k "$kernel_release"
+    fi
     make -C "$build_dir/amneziawg-tools-$TOOLS_REV/src" -j "$(nproc)"
     make -C "$build_dir/amneziawg-tools-$TOOLS_REV/src" install PREFIX=/usr/local DESTDIR="$build_dir/staged" \
         WITH_WGQUICK=yes WITH_SYSTEMDUNITS=no WITH_BASHCOMPLETION=no
     install -d -m 700 "$build_dir/backup"
-    local binary
-    for binary in awg awg-quick amneziawg-go; do
+    for binary in awg awg-quick; do
         if [[ -f /usr/local/bin/$binary ]]; then
             cp -p "/usr/local/bin/$binary" "$build_dir/backup/$binary"
         fi
     done
-    install -m 755 "$build_dir/amneziawg-go" /usr/local/bin/amneziawg-go.new
-    install -m 755 "$build_dir/staged/usr/local/bin/awg" /usr/local/bin/awg.new
-    install -m 755 "$build_dir/staged/usr/local/bin/awg-quick" /usr/local/bin/awg-quick.new
-    for binary in awg awg-quick amneziawg-go; do
+    modinfo -n amneziawg > "$build_dir/backup/module-path.txt" 2>/dev/null || true
+    if [[ -s $build_dir/backup/module-path.txt ]]; then
+        cp -p "$(cat "$build_dir/backup/module-path.txt")" "$build_dir/backup/"
+    fi
+    dkms install --force -m amneziawg -v "$module_version" -k "$kernel_release"
+    depmod -a "$kernel_release"
+    for binary in awg awg-quick; do
+        install -m 755 "$build_dir/staged/usr/local/bin/$binary" "/usr/local/bin/$binary.new"
         mv "/usr/local/bin/$binary.new" "/usr/local/bin/$binary"
     done
-    printf '%s\n' "go=$GO_REV" "tools=$TOOLS_REV" "toolchain=$go_version" > "$build_dir/source-versions.txt"
-    echo "Installed source builds. Build files, revisions and previous binaries: $build_dir"
+    install -d /usr/local/share
+    printf '%s\n' "kernel=$KERNEL_REV" "tools=$TOOLS_REV" "dkms=$module_version" > "$build_dir/source-versions.txt"
+    install -m 644 "$build_dir/source-versions.txt" /usr/local/share/amnezia-site-source-versions
+    echo "Installed DKMS module and tools. Sources, previous binaries/module: $build_dir"
+    echo "Existing tunnels were not stopped; obsolete DKMS versions are retained for rollback."
+    kernel_check
 }
 
 update_tools() {
-    local awg_path package
-    local -a packages=()
-    awg_path=$(command -v awg) || fail "AmneziaWG is not installed; run install first"
-    echo "Updating AmneziaWG; configuration and keys are retained."
-    if [[ $awg_path == /usr/local/bin/awg && -x /usr/local/bin/amneziawg-go ]]; then
-        install -d -m 700 "$STATE"
-        install_tools update
-    elif [[ $awg_path == /usr/bin/awg ]] && dpkg-query -S /usr/bin/awg >/dev/null 2>&1; then
-        for package in amneziawg-tools amneziawg-dkms amneziawg; do
-            if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) == 'install ok installed' ]]; then
-                packages+=("$package")
-            fi
-        done
-        [[ ${#packages[@]} -gt 0 ]] || fail "Cannot identify installed AmneziaWG packages"
-        apt-get update
-        apt-get install -y --only-upgrade "${packages[@]}"
-        echo "Updated installed AmneziaWG packages from your configured APT repositories."
-        echo "A DKMS update does not replace a loaded kernel module. Schedule a reboot if the module changed."
-    else
-        fail "Unrecognized installation at $awg_path; update it with its original installer"
-    fi
-    echo "No service restart requested by this script. APT hooks may restart services."
-    echo "Restart userspace tunnels during maintenance to use the new binaries."
-    echo "For this tunnel: systemctl restart $UNIT"
+    echo "Updating official kernel/tools sources; keys and configuration are retained."
+    install_tools update
+    echo "No tunnel restarted. After kernel-check succeeds: systemctl restart $UNIT"
 }
 
 write_config() {
@@ -639,25 +660,32 @@ Address = $LOCAL_IP/32
 Table = auto
 ListenPort = $PORT
 MTU = 1280
-Jc = 4
+Jc = 0
 Jmin = 40
 Jmax = 70
-S1 = 17
-S2 = 29
-S3 = 16
-S4 = 16
+S1 = 32
+S2 = 32
+S3 = 32
+S4 = 32
 HeaderProtectionKey = $header_key
-ContentPaddingAddition = 0-32
-H1 = 1234567891
-H2 = 1234567892
-H3 = 1234567893
-H4 = 1234567894
+ContentPaddingAddition = 16-64
+RandomTrailers = off
+DisableCookies = off
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
 EOF
+    if [[ $ROLE == connector ]]; then
+        sed -i 's/^Jc = 0$/Jc = 4/' "$config_tmp"
+    fi
     if [[ -n ${PEER_KEY:-} ]]; then
         cat >> "$config_tmp" <<EOF
 
 [Peer]
 PublicKey = $PEER_KEY
+PresharedKey = $(cat "$STATE/preshared.key")
+AdvancedSecurity = on
 AllowedIPs = $PEER_IP/32
 EOF
         if [[ $ROLE == connector ]]; then
@@ -680,13 +708,19 @@ After=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=/bin/false
+ExecStartPre=/usr/bin/env AWG_INTERFACE=$INTERFACE bash /usr/local/lib/amnezia-site-to-site.sh kernel-check
 ExecStart=$quick up $CONFIG
+ExecStartPost=/usr/bin/env AWG_INTERFACE=$INTERFACE bash /usr/local/lib/amnezia-site-to-site.sh kernel-interface-check
 ExecStop=$quick down $CONFIG
 
 [Install]
 WantedBy=multi-user.target
 EOF
     chmod 644 "$SERVICE"
+    if [[ $SCRIPT_PATH != /usr/local/lib/amnezia-site-to-site.sh ]]; then
+        install -D -m 700 "$SCRIPT_PATH" /usr/local/lib/amnezia-site-to-site.sh
+    fi
     systemctl daemon-reload
 }
 
@@ -718,11 +752,12 @@ if [[ $1 == ensure-listener || $1 == ensure-connector ]]; then
         else
             [[ $# -eq 1 && -f $1 ]] || fail "Connector bundle required"
             mapfile -t bundle < "$1"
-            [[ ${#bundle[@]} -eq 7 && ${bundle[0]} == AWG-SITE-V2 && ${settings[0]} == "${bundle[4]}" && ${settings[1]} == "${bundle[3]}" && ${settings[2]} == "${bundle[1]}" && ${settings[3]} == "${bundle[2]}" ]] || fail "Existing connector settings differ; choose another interface"
+            [[ ${#bundle[@]} -eq 8 && ${bundle[0]} == AWG-SITE-V3 && ${settings[0]} == "${bundle[4]}" && ${settings[1]} == "${bundle[3]}" && ${settings[2]} == "${bundle[1]}" && ${settings[3]} == "${bundle[2]}" ]] || fail "Existing connector settings differ; choose another interface"
             grep -Fxq "PublicKey = ${bundle[5]}" "$CONFIG" || fail "Existing listener public key differs"
             [[ -f $STATE/header.key && $(cat "$STATE/header.key") == "${bundle[6]}" ]] || fail "Existing AWG 3 header protection key differs"
+            [[ -f $STATE/preshared.key && $(cat "$STATE/preshared.key") == "${bundle[7]}" ]] || fail "Existing peer preshared key differs"
         fi
-        [[ -f $STATE/header.key ]] && grep -q '^HeaderProtectionKey = ' "$CONFIG" || fail "Existing configuration does not enable AWG 3; use a new interface for this setup"
+        require_profile
         echo "Matching $action configuration retained."
         exit
     fi
@@ -746,6 +781,14 @@ fi
         [[ $# -eq 1 ]] || fail "update takes no arguments"
         update_tools
         ;;
+    kernel-check)
+        [[ $# -eq 1 ]] || fail "kernel-check takes no arguments"
+        kernel_check
+        ;;
+    kernel-interface-check)
+        [[ $# -eq 1 ]] || fail "kernel-interface-check takes no arguments"
+        kernel_interface_check
+        ;;
     install)
         [[ $# -eq 1 ]] || fail "install takes no arguments"
         install -d -m 700 "$STATE"
@@ -763,6 +806,7 @@ fi
         ;;
     listener|connector)
         command -v awg >/dev/null && command -v awg-quick >/dev/null || fail "Run install first"
+        kernel_check
         [[ ! -e $CONFIG && ! -e $STATE/role && ! -e $SERVICE ]] || fail "Interface already configured; choose another AWG_INTERFACE"
         ip link show dev "$INTERFACE" >/dev/null 2>&1 && fail "Interface already exists"
         ROLE=$1
@@ -773,10 +817,11 @@ fi
         else
             [[ $# -eq 2 && -f $2 ]] || fail "connector requires a bundle file"
             mapfile -t bundle < "$2"
-            [[ ${#bundle[@]} -eq 7 && ${bundle[0]} == AWG-SITE-V2 ]] || fail "An AWG 3 bundle (AWG-SITE-V2) is required; legacy bundles are not supported"
+            [[ ${#bundle[@]} -eq 8 && ${bundle[0]} == AWG-SITE-V3 ]] || fail "An AWG 3 bundle (AWG-SITE-V3) is required; legacy bundles are not supported"
             ENDPOINT=${bundle[1]} PORT=${bundle[2]} PEER_IP=${bundle[3]} LOCAL_IP=${bundle[4]} PEER_KEY=${bundle[5]}
             valid_key "$PEER_KEY"
             valid_key "${bundle[6]}"
+            valid_key "${bundle[7]}"
         fi
         [[ $ENDPOINT =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || fail "Endpoint must be an IPv4 address or hostname"
         [[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((PORT <= 65535)) || fail "Invalid UDP port"
@@ -789,17 +834,20 @@ fi
         install -d -m 700 "$STATE" "$CONFIG_DIR"
         if [[ $ROLE == listener ]]; then
             [[ -e $STATE/header.key ]] || awg genkey > "$STATE/header.key"
+            [[ -e $STATE/preshared.key ]] || awg genpsk > "$STATE/preshared.key"
         else
             printf '%s\n' "${bundle[6]}" > "$STATE/header.key"
+            printf '%s\n' "${bundle[7]}" > "$STATE/preshared.key"
         fi
         [[ -e $STATE/private.key ]] || awg genkey > "$STATE/private.key"
         awg pubkey < "$STATE/private.key" > "$STATE/public.key"
         printf '%s\n' "$ROLE" > "$STATE/role"
+        printf '%s\n' AWG-SITE-V3 > "$STATE/profile"
         printf '%s\n' "$LOCAL_IP" "$PEER_IP" "$ENDPOINT" "$PORT" > "$STATE/settings"
         write_config
         write_service
         if [[ $ROLE == listener ]]; then
-            printf 'AWG-SITE-V2\n%s\n%s\n%s\n%s\n%s\n%s\n' "$ENDPOINT" "$PORT" "$LOCAL_IP" "$PEER_IP" "$(cat "$STATE/public.key")" "$(cat "$STATE/header.key")" > "$STATE/bundle.txt"
+            printf 'AWG-SITE-V3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$ENDPOINT" "$PORT" "$LOCAL_IP" "$PEER_IP" "$(cat "$STATE/public.key")" "$(cat "$STATE/header.key")" "$(cat "$STATE/preshared.key")" > "$STATE/bundle.txt"
             echo "AWG 3 configured. Confidential connector bundle: $STATE/bundle.txt"
         else
             cat "$STATE/public.key"
@@ -809,6 +857,7 @@ fi
         [[ $# -eq 2 ]] || fail "peer requires a public key"
         valid_key "$2"
         [[ -f $STATE/role && $(cat "$STATE/role") == listener ]] || fail "Run listener first"
+        require_profile
         if [[ -e $STATE/peer.key ]]; then
             [[ $(cat "$STATE/peer.key") == "$2" ]] || fail "A different peer is already enrolled"
             echo "Matching peer key retained."
@@ -824,6 +873,8 @@ fi
     up)
         [[ $# -eq 1 ]] || fail "up takes no arguments"
         [[ -f $CONFIG && -f $SERVICE ]] || fail "Configure listener or connector first"
+        require_profile
+        kernel_check
         grep -q '^\[Peer\]$' "$CONFIG" || fail "Enroll the connector public key first"
         grep -q '^HeaderProtectionKey = ' "$CONFIG" || fail "AWG 3 header protection is required; configure a new interface"
         systemctl enable --now "$UNIT"

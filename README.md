@@ -1,4 +1,4 @@
-# AmneziaWG 3 site-to-site setup
+# AmneziaWG 3.1 kernel-only site-to-site setup
 
 Connect two Debian/Ubuntu servers using one terminal. One server is the
 **listener**: it has a public hostname/IP and accepts inbound UDP. The other
@@ -38,10 +38,10 @@ possible. Each SSH user needs root or permission to run commands with sudo;
 sudo may ask for its password for each privileged action.
 
 The controller checks that the connections have different machine IDs,
-uploads the script, installs missing tools, exchanges public keys, prepares
+uploads the script, bootstraps the kernel module/tools, exchanges public keys, prepares
 the selected host firewall, starts both services and checks connectivity.
 Private WireGuard keys remain on their own servers. The connector bundle
-contains the shared AWG 3 header-protection secret and is transferred only
+contains the shared AWG 3.1 header-protection key and peer PSK and is transferred only
 through SSH without printing it. Temporary SSH connection
 sharing reduces repeated login prompts; connections are closed on exit.
 
@@ -124,50 +124,87 @@ current networks. Choose another interface in the wizard or consistently set
 
 ## Installation and updates
 
-`install` retains existing `awg`/`awg-quick` commands, which need a working
-AmneziaWG module or userspace implementation. Clean amd64/arm64 Debian/Ubuntu
-hosts install build dependencies and build official tools and userspace at
-pinned commits. The latest stable Go archive is checked against the official
-checksum manifest. Installation needs root, systemd, `/dev/net/tun`, and
-internet access to package repositories, GitHub, Go and Go dependencies.
-No Ubuntu PPA or third-party installer is added to Debian.
+`install` bootstraps **kernel-only AWG 3.1** on Debian/Ubuntu systemd hosts.
+It installs distro build dependencies, DKMS and headers for the running kernel,
+then builds official kernel/tools sources at pinned commits. No Ubuntu PPA is
+added to Debian; Go and `/dev/net/tun` are not required. Root and internet access
+to APT and GitHub are required. Kernel builds may take several minutes.
 
-The kernel module is used when available, otherwise userspace, which generally
-has lower throughput. Both implementations and tools must support AWG 3.
-New configurations enable `HeaderProtectionKey`, set all `S1`–`S4` paddings
-to at least 12 bytes, and enable `ContentPaddingAddition = 0-32`. Legacy
-six-line bundles and configurations without header protection are refused
-by the controller: choose a new interface for a fresh AWG 3 setup.
-Build files and exact revisions are retained.
+DKMS sources live under `/usr/src/amneziawg-VERSION/` and automatically rebuild
+for future kernels when matching headers are installed. Tools are installed in
+`/usr/local/bin`; existing distro packages are not removed. Retained builds,
+source revisions and backups are recorded under this interface's state directory.
+Previously installed DKMS versions are retained for rollback. Before future
+kernel upgrades, have an administrator retire obsolete registrations with
+`dkms remove -m amneziawg -v OLD_VERSION --all`, keeping the selected version.
+Avoid mixing subsequent package-managed AWG upgrades with this source installer.
 
-`Table = auto` enables routes only for `AllowedIPs`, which here contains the
-peer tunnel IPv4 `/32`. No default route is installed. `Table = on` is not
-a valid awg-quick setting; valid values are `auto`, `off`, or a table number/name.
-Using `off` requires the administrator to install the peer route separately.
+Installation fails clearly if running-kernel headers are unavailable or the module
+cannot load. Secure Boot may require enrolling the DKMS signing key through the
+machine/provider console; the script never disables Secure Boot. Containers
+need host-level module administration and are not bootstrapped automatically.
 
-Update through the local wizard or:
+The installer **never unloads an existing module or stops existing tunnels**.
+If the installed module differs from the loaded module, installation reports
+that maintenance/reboot is needed and returns failure. Reboot, then rerun the
+same command/controller. Merely restarting a tunnel does not replace its module.
+Use `kernel-check` to verify the loaded and installed module match.
+Systemd checks this before startup and explicitly disables userspace fallback.
+
+### Configuration defaults
+
+New profiles use:
+
+- Separate private keys on each host; a random shared header-protection key
+  and a separate random per-peer preshared key, transferred only through SSH.
+- `S1 = S2 = S3 = S4 = 32`, with `H1 = 1`, `H2 = 2`, `H3 = 3`, `H4 = 4`.
+  Standard header values are recommended when header protection is enabled;
+  the message type is still hidden by header protection.
+- `ContentPaddingAddition = 16-64`, `RandomTrailers = off`,
+  `DisableCookies = off`; default protocol timers are retained.
+  Cookie replies retain DoS protection. Padding values are conservative project
+  defaults, not a guarantee of censorship resistance.
+- Kernel peer `AdvancedSecurity = on`, MTU 1280, and only the peer's tunnel /32.
+- Connector-only junk packets (`Jc = 4`, `Jmin = 40`, `Jmax = 70`) and
+  `PersistentKeepalive = 25`; the listener has no persistent keepalive.
+
+All secret files are created with restrictive permissions. The confidential
+eight-line `AWG-SITE-V3` bundle contains both shared secrets. Older bundles and
+profiles are refused: choose a new interface and configure both servers together.
+Updates do not silently rewrite existing configuration or rotate keys.
+For stricter least privilege, select administrator-managed firewall handling
+and allow only required services from the peer; automatic firewall handling
+still permits all local services from the peer tunnel IP.
+
+`Table = auto` routes only the configured peer IPv4 `/32`, not internet traffic.
+`Table = on` is invalid; `off` requires manually installing the peer route.
+
+### Updates and recovery
+
+Update through the wizard or:
 
 ```bash
 sudo bash ./amnezia-site-to-site.sh update
+sudo bash ./amnezia-site-to-site.sh kernel-check
 ```
 
-APT installations upgrade only installed AmneziaWG packages from configured
-repositories. Source installations in `/usr/local/bin` build current official
-upstream `master` commits, stage both components and back up old executables
-before replacing them. Commits may include changes newer than tagged releases.
-Unrecognized installations are refused.
+Updates resolve current official upstream `master` commits for both kernel and
+tools, validate that the kernel identifies as 3.1, build before replacing
+installed components, and retain previous tools/module and DKMS registrations.
+Master commits are not necessarily tagged releases. GitHub API rate limits or
+download failures abort the action; no unverified fallback installer is used.
 
-Updates retain keys/configuration but affect shared binaries/packages and all
-AmneziaWG tunnels on the host. Use a maintenance window. The script does not
-explicitly restart services during update; APT hooks may. The local wizard
-offers a separate restart for this tunnel. Restart other userspace tunnels
-to load new binaries. A DKMS update does not replace a loaded kernel module:
-schedule a reboot if the module changed.
+Updates affect shared module/tools on the host, including other AWG tunnels.
+Plan a maintenance window and keep console access available. If a reboot is
+required, perform it before restarting services. The wizard offers to restart
+only this project's tunnel after `kernel-check` succeeds. Existing keys,
+addresses, routes and profiles are retained.
 
-Build failures before replacement retain installed executables. For source
-rollback, restore `awg`, `awg-quick`, `amneziawg-go` from the build directory's
-`backup/` to `/usr/local/bin` and restart affected userspace tunnels. APT
-rollback depends on available versions. Verify connectivity after updates.
+For source rollback, an administrator can reinstall a retained earlier DKMS
+registration for the running kernel with `dkms install --force -m amneziawg
+-v OLD_VERSION -k KERNEL_RELEASE`, restore backed-up tools to `/usr/local/bin`,
+and reboot to load the matching module. Module backups are recovery artifacts,
+not an automatic rollback system. Verify handshakes and connectivity afterward.
 
 ## Administrator notes
 
@@ -191,5 +228,6 @@ available for firewall administration. Useful future additions include saved
 non-secret connection profiles, a diagnostics report, scoped service access
 and a cleanup wizard.
 
-References: [AmneziaWG userspace](https://github.com/amnezia-vpn/amneziawg-go)
-and [AmneziaWG tools](https://github.com/amnezia-vpn/amneziawg-tools).
+References: [AWG 3.1 configuration and security](https://docs.amnezia.org/documentation/amnezia-wg/),
+[kernel module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
+and [tools](https://github.com/amnezia-vpn/amneziawg-tools).
