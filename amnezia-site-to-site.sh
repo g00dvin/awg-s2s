@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version: 1.1.0 (kernel-only AmneziaWG 3.1)
+# Version: 1.1.1 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -553,6 +553,35 @@ if not links or links[0].get("linkinfo", {}).get("info_kind") != "amneziawg":
 '
 }
 
+ensure_kernel_headers() {
+    local kernel_release=$1 candidate architecture
+    if [[ -f /lib/modules/$kernel_release/build/Makefile ]]; then
+        echo "Using existing headers for the running kernel: $kernel_release"
+        return
+    fi
+    candidate=$(apt-cache policy "linux-headers-$kernel_release" | awk '/Candidate:/ {print $2}')
+    if [[ -z $candidate || $candidate == '(none)' ]]; then
+        echo "Headers for running kernel $kernel_release are not available in your configured APT repositories." >&2
+        echo "No kernel upgrade or reboot was performed. Keep provider console access available." >&2
+        if [[ $ID == debian ]]; then
+            architecture=$(dpkg --print-architecture)
+            case $architecture in
+                amd64|arm64)
+                    echo "For a standard Debian kernel, during maintenance run:" >&2
+                    echo "  sudo apt-get install linux-image-$architecture linux-headers-$architecture" >&2
+                    echo "  sudo reboot" >&2
+                    ;;
+                *) echo "Install your architecture's supported kernel and matching headers, then reboot." >&2 ;;
+            esac
+        else
+            echo "Install headers from the kernel's original trusted source, or install a supported Ubuntu kernel and its matching headers, then reboot." >&2
+        fi
+        fail "Rerun this script after booting the matching kernel. Headers for a different kernel cannot build a module for $kernel_release"
+    fi
+    apt-get install -y "linux-headers-$kernel_release"
+    [[ -f /lib/modules/$kernel_release/build/Makefile ]] || fail "Installed headers do not provide the running kernel's build tree; check the kernel package and /lib/modules/$kernel_release/build"
+}
+
 install_tools() {
     local mode=${1:-install}
     [[ -f /etc/os-release ]] || fail "Cannot identify operating system"
@@ -564,8 +593,8 @@ install_tools() {
     [[ $kernel_release =~ ^[a-zA-Z0-9._+-]+$ ]] || fail "Invalid kernel release"
     install -d -m 700 "$STATE"
     apt-get update
-    apt-get install -y ca-certificates curl python3 build-essential dkms kmod iproute2 "linux-headers-$kernel_release"
-    [[ -d /lib/modules/$kernel_release/build ]] || fail "Running-kernel headers unavailable; install a supported distro kernel and reboot first"
+    ensure_kernel_headers "$kernel_release"
+    apt-get install -y ca-certificates curl python3 build-essential dkms kmod iproute2
     build_dir=$(mktemp -d "$STATE/build.XXXXXXXX")
     if [[ $mode == update ]]; then
         for component in kernel tools; do
