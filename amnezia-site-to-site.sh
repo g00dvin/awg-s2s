@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version: 1.3.1 (kernel-only AmneziaWG 3.1)
+# Version: 1.4.0 (kernel-only AmneziaWG 3.1)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -58,6 +58,7 @@ Usage (run with sudo/root):
   bash amnezia-site-to-site.sh connector BUNDLE_FILE
   bash amnezia-site-to-site.sh peer PUBLIC_KEY
   bash amnezia-site-to-site.sh up
+  bash amnezia-site-to-site.sh migrate
   bash amnezia-site-to-site.sh status
   bash amnezia-site-to-site.sh verify
   bash amnezia-site-to-site.sh firewall ufw|nft
@@ -66,7 +67,7 @@ Defaults: interface awg-site, UDP 51830, listener 10.203.77.1,
 connector 10.203.77.2. Set AWG_INTERFACE to choose another interface.
 listener saves a confidential AWG 3 bundle; connector prints its public key.
 Run peer on the listener with that key, then up on both servers.
-Table = off: tunnel routes are never installed automatically. Firewall rules are separate.
+Table = off: only the peer tunnel /32 is added explicitly; LAN/default routes stay manual.
 AWG_ALLOWED_IPS sets IPv4 peer networks; the peer tunnel address is always covered.
 AWG_PLAN_FILE overrides the wizard/controller plan path (no passwords or keys).
 Run without arguments to launch the step-by-step wizard.
@@ -253,7 +254,7 @@ configuration_table() {
     ui_section '4 / 4  Review configuration'
     ui_row Interface "$INTERFACE"
     ui_row Protocol 'AmneziaWG 3.1 / kernel only'
-    ui_row Routing 'Manual (Table = off)'
+    ui_row Routing 'Peer /32 automatic; other routes manual'
     for node in listener connector; do
         ui_section "$node"
         ui_row Server "$(node_label "$node")"
@@ -273,7 +274,7 @@ configuration_table() {
     done
     ui_section 'Before applying'
     ui_hint "Allow UDP $port on the listener and in the provider firewall."
-    ui_hint 'No routes are added, including for /0. Configure routing yourself.'
+    ui_hint 'Only the peer tunnel /32 route is added. LAN and default routes remain manual.'
     ui_hint 'Automatic firewall modes allow all local services from the peer tunnel IP.'
     ui_hint 'Existing profiles must match. Keys and configurations are not silently replaced.'
 }
@@ -423,7 +424,7 @@ collect_controller_plan() {
     plan_ask_validated listener_ip "Listener tunnel IPv4 address" 10.203.77.1 valid_ip; listener_ip=$ANSWER
     plan_ask_validated connector_ip "Connector tunnel IPv4 address" 10.203.77.2 valid_peer_ip "$listener_ip"; connector_ip=$ANSWER
     ui_section '2 / 4  Peer addresses'
-    ui_hint 'Enter CIDRs separated by commas or spaces. /0 is allowed; routes remain manual.'
+    ui_hint 'Enter CIDRs separated by commas or spaces. /0 is allowed; only the peer /32 gets a route.'
     ui_hint 'Each field describes addresses reachable THROUGH THE OTHER SERVER.'
     for node in listener connector; do
         if [[ $node == listener ]]; then
@@ -539,7 +540,7 @@ controller() {
     echo "Step 5/5: Start both tunnels and check connectivity"
     node_command listener up
     node_command connector up
-    echo "Table=off: ping needs manually configured routes; handshake verification does not."
+    echo "Peer tunnel /32 routes are ready. LAN/default routing remains administrator-managed."
     if ! on_node connector "ping -c 5 -W 2 $(shell_quote "$listener_ip")"; then
         echo "Ping failed. Both configurations are saved. Check UDP access and latest handshake below."
     fi
@@ -665,8 +666,10 @@ set_paths() {
     STATE=/etc/amnezia/site-to-site/$INTERFACE
     CONFIG_DIR=/etc/amnezia/amneziawg
     CONFIG=$CONFIG_DIR/$INTERFACE.conf
-    SERVICE=/etc/systemd/system/amnezia-site-$INTERFACE.service
-    UNIT=amnezia-site-$INTERFACE.service
+    UNIT=awg-quick@$INTERFACE.service
+    SERVICE=/etc/systemd/system/$UNIT.d/site-to-site.conf
+    LEGACY_UNIT=amnezia-site-$INTERFACE.service
+    LEGACY_SERVICE=/etc/systemd/system/$LEGACY_UNIT
 }
 
 ask() {
@@ -706,7 +709,7 @@ Administrator notes
   Allow the listener's UDP port in both host and provider firewalls.
   Allow replies to outbound UDP on the connector, and desired local traffic from $INTERFACE.
   Check tunnel IPs against existing routes before configuring either server.
-  Table=off: AllowedIPs does not install routes. Configure even the peer /32 route manually.
+  Table=off: only the peer tunnel /32 route is added explicitly by this service.
   LAN forwarding, return routes and firewall rules require manual administration; NAT is not enabled.
   Troubleshooting: journalctl -u $UNIT -n 50
   Stop and disable: systemctl disable --now $UNIT
@@ -728,7 +731,10 @@ show_status() {
     echo "Service: $UNIT"
     systemctl is-active "$UNIT" || true
     if ip link show dev "$INTERFACE" >/dev/null 2>&1; then
-        awg show "$INTERFACE"
+        awg show "$INTERFACE" public-key
+        awg show "$INTERFACE" allowed-ips
+        awg show "$INTERFACE" latest-handshakes
+        awg show "$INTERFACE" transfer
         ip -brief address show dev "$INTERFACE"
         echo "A started service alone does not confirm connectivity; check the latest handshake and ping."
     else
@@ -809,7 +815,7 @@ wizard() {
         default_allowed=$(cat "$STATE/allowed-ips" 2>/dev/null || sed -n 's/^AllowedIPs = //p' "$CONFIG")
         default_allowed=${default_allowed:-$peer_ip/32}
     fi
-    echo "AllowedIPs selects the peer's addresses; /0 is allowed. Table=off: all tunnel routes remain manual."
+    ui_hint 'AllowedIPs may include /0. Only the peer tunnel /32 route is added; other routes stay manual.'
     plan_ask_validated local_allowed "AllowedIPs on this server (IPv4 CIDRs separated by commas or spaces)" "$default_allowed" valid_wizard_allowed "$peer_ip" "$local_ip"
     normalize_allowed_ips "$ANSWER" "$peer_ip" "$local_ip"
     LOCAL_ALLOWED=$ALLOWED_IPS
@@ -826,7 +832,7 @@ wizard() {
     ui_row Role "$role"; ui_row Interface "$INTERFACE"
     ui_row 'Tunnel address' "$local_ip/32"; ui_row 'Peer address' "$peer_ip/32"
     ui_row AllowedIPs "$LOCAL_ALLOWED"; ui_row 'UDP endpoint' "$endpoint:$port"
-    ui_row Firewall "$(firewall_label "$firewall")"; ui_row Routing 'Manual (Table = off)'
+    ui_row Firewall "$(firewall_label "$firewall")"; ui_row Routing 'Peer /32 automatic; other routes manual'
     ui_hint 'Only this server will change. Configure the other end separately.'
     local review_status
     if approve_plan; then :; else
@@ -1051,6 +1057,7 @@ install_tools() {
         grep -Fxq "tools=$TOOLS_REV" /usr/local/share/amnezia-site-source-versions &&
         [[ -x /usr/local/bin/awg && -x /usr/local/bin/awg-quick ]] &&
         dkms status -m amneziawg -v "$module_version" -k "$kernel_release" | grep -q ': installed'; then
+        ensure_standard_service
         kernel_check
         return
     fi
@@ -1105,6 +1112,7 @@ EOF
     install -m 644 "$build_dir/source-versions.txt" /usr/local/share/amnezia-site-source-versions
     echo "Installed DKMS module and tools. Sources, previous binaries/module: $build_dir"
     echo "Existing tunnels were not stopped; obsolete DKMS versions are retained for rollback."
+    ensure_standard_service
     kernel_check
 }
 
@@ -1124,6 +1132,7 @@ write_config() {
 PrivateKey = $private_key
 Address = $LOCAL_IP/32
 Table = off
+PostUp = /usr/bin/env AWG_INTERFACE=%i bash /usr/local/lib/amnezia-site-to-site.sh route-peer
 ListenPort = $PORT
 MTU = 1280
 Jc = 0
@@ -1161,33 +1170,104 @@ EOF
     mv "$config_tmp" "$CONFIG"
 }
 
-write_service() {
-    local quick
-    quick=$(command -v awg-quick)
-    cat > "$SERVICE" <<EOF
-[Unit]
-Description=AmneziaWG site-to-site $INTERFACE
-Wants=network-online.target
-After=network-online.target
+route_peer() {
+    require_profile
+    require_manual_routing
+    kernel_interface_check
+    local local_ip peer_ip existing
+    local -a route_settings
+    mapfile -t route_settings < "$STATE/settings"
+    local_ip=${route_settings[0]} peer_ip=${route_settings[1]}
+    valid_ip "$local_ip"; valid_peer_ip "$peer_ip" "$local_ip"
+    existing=$(ip -j -4 route show table main exact "$peer_ip/32")
+    if [[ $existing != '[]' ]]; then
+        printf '%s' "$existing" | python3 -c '
+import json, sys
+routes = json.load(sys.stdin)
+if not routes or any(route.get("dev") != sys.argv[1] or route.get("type", "unicast") != "unicast" or "gateway" in route or route.get("prefsrc", sys.argv[2]) != sys.argv[2] for route in routes):
+    raise SystemExit("Conflicting peer /32 route already exists; it was not replaced. Review your main routing table.")
+' "$INTERFACE" "$local_ip" || fail "Peer route conflict; existing administrator-managed route was preserved"
+        return
+    fi
+    ip -4 route add "$peer_ip/32" dev "$INTERFACE" src "$local_ip"
+    echo "Peer route ready: $peer_ip/32 dev $INTERFACE src $local_ip"
+}
 
+ensure_standard_service() {
+    systemctl cat awg-quick@.service >/dev/null 2>&1 && return 0
+    local temporary name
+    temporary=$(mktemp -d "$STATE/systemd.XXXXXXXX")
+    for name in wg-quick@.service wg-quick.target; do
+        curl -fsSL "https://raw.githubusercontent.com/amnezia-vpn/amneziawg-tools/$TOOLS_REV/src/systemd/$name" -o "$temporary/$name"
+    done
+    install -d /usr/local/lib/systemd/system
+    install -m 644 "$temporary/wg-quick@.service" /usr/local/lib/systemd/system/awg-quick@.service
+    install -m 644 "$temporary/wg-quick.target" /usr/local/lib/systemd/system/awg-quick.target
+    rm -rf "$temporary"
+    systemctl daemon-reload
+}
+
+write_service() {
+    local quick tools hook temporary
+    quick=$(command -v awg-quick)
+    tools=$(command -v awg)
+    ensure_standard_service
+    install -d /etc/systemd/system/"$UNIT.d"
+    cat > "$SERVICE" <<EOF
 [Service]
-Type=oneshot
-RemainAfterExit=yes
 Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=/bin/false
-ExecStartPre=/usr/bin/env AWG_INTERFACE=$INTERFACE bash /usr/local/lib/amnezia-site-to-site.sh kernel-check
-ExecStart=$quick up $CONFIG
-ExecStartPost=/usr/bin/env AWG_INTERFACE=$INTERFACE bash /usr/local/lib/amnezia-site-to-site.sh kernel-interface-check
-ExecStop=$quick down $CONFIG
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=
+ExecStart=$quick up %i
+ExecStop=
+ExecStop=$quick down %i
+ExecReload=
+ExecReload=/bin/bash -c 'exec $tools syncconf %i <(exec $quick strip %i)'
+ExecStartPre=/usr/bin/env AWG_INTERFACE=%i bash /usr/local/lib/amnezia-site-to-site.sh kernel-check
+ExecStartPost=/usr/bin/env AWG_INTERFACE=%i bash /usr/local/lib/amnezia-site-to-site.sh kernel-interface-check
 EOF
     chmod 644 "$SERVICE"
     if [[ $SCRIPT_PATH != /usr/local/lib/amnezia-site-to-site.sh ]]; then
         install -D -m 700 "$SCRIPT_PATH" /usr/local/lib/amnezia-site-to-site.sh
     fi
+    hook='PostUp = /usr/bin/env AWG_INTERFACE=%i bash /usr/local/lib/amnezia-site-to-site.sh route-peer'
+    if ! grep -Fxq "$hook" "$CONFIG"; then
+        cp -p "$CONFIG" "$STATE/config-before-standard.conf"
+        temporary=$(mktemp "$CONFIG_DIR/$INTERFACE.XXXXXXXX")
+        awk -v hook="$hook" '{print} /^\[Interface\]$/ {print hook}' "$CONFIG" > "$temporary"
+        chmod 600 "$temporary"
+        mv "$temporary" "$CONFIG"
+    fi
     systemctl daemon-reload
+}
+
+migrate_service() {
+    [[ -f $LEGACY_SERVICE && -f $CONFIG ]] || fail "No legacy service to migrate"
+    require_profile
+    require_manual_routing
+    kernel_check
+    systemctl is-active --quiet "$UNIT" && fail "Standard service is already active; review the legacy service manually"
+    write_service
+    if [[ -f /etc/systemd/system/$LEGACY_UNIT.d/firewall.conf ]]; then
+        install -m 644 /etc/systemd/system/"$LEGACY_UNIT.d/firewall.conf" /etc/systemd/system/"$UNIT.d/firewall.conf"
+    fi
+    systemctl daemon-reload
+    echo "Migrating $LEGACY_UNIT to $UNIT; the tunnel will briefly restart."
+    systemctl stop "$LEGACY_UNIT"
+    if systemctl enable --now "$UNIT"; then
+        systemctl disable "$LEGACY_UNIT"
+        mv "$LEGACY_SERVICE" "$STATE/legacy-service.backup"
+        if [[ -d /etc/systemd/system/$LEGACY_UNIT.d ]]; then
+            mv /etc/systemd/system/"$LEGACY_UNIT.d" "$STATE/legacy-dropins.backup"
+        fi
+        systemctl daemon-reload
+        echo "Migration complete: $UNIT"
+    else
+        systemctl stop "$UNIT" || true
+        systemctl disable "$UNIT" || true
+        systemctl start "$LEGACY_UNIT" || fail "Migration failed and legacy restart failed; check the journal"
+        fail "Migration failed; legacy service was restarted"
+    fi
 }
 
 [[ ${1:-} != --help && ${1:-} != -h ]] || { usage; exit 0; }
@@ -1213,7 +1293,8 @@ if [[ $1 == ensure-listener || $1 == ensure-connector ]]; then
     action=${1#ensure-}
     shift
     if [[ -f $STATE/role ]]; then
-        [[ $(cat "$STATE/role") == "$action" && -f $CONFIG && -f $SERVICE ]] || fail "Existing configuration has a different role or is incomplete"
+        [[ $(cat "$STATE/role") == "$action" && -f $CONFIG ]] || fail "Existing configuration has a different role or is incomplete"
+        [[ ! -e $LEGACY_SERVICE ]] || fail "Run migrate first to switch the legacy service to $UNIT"
         mapfile -t settings < "$STATE/settings"
         if [[ $action == listener ]]; then
             [[ $# -eq 4 && ${settings[0]} == "$3" && ${settings[1]} == "$4" && ${settings[2]} == "$1" && ${settings[3]} == "$2" ]] || fail "Existing listener settings differ; choose another interface"
@@ -1258,6 +1339,14 @@ fi
         [[ $# -eq 1 ]] || fail "kernel-interface-check takes no arguments"
         kernel_interface_check
         ;;
+    route-peer)
+        [[ $# -eq 1 ]] || fail "route-peer takes no arguments"
+        route_peer
+        ;;
+    migrate)
+        [[ $# -eq 1 ]] || fail "migrate takes no arguments"
+        migrate_service
+        ;;
     install)
         [[ $# -eq 1 ]] || fail "install takes no arguments"
         install -d -m 700 "$STATE"
@@ -1276,7 +1365,7 @@ fi
     listener|connector)
         command -v awg >/dev/null && command -v awg-quick >/dev/null || fail "Run install first"
         kernel_check
-        [[ ! -e $CONFIG && ! -e $STATE/role && ! -e $SERVICE ]] || fail "Interface already configured; choose another AWG_INTERFACE"
+        [[ ! -e $CONFIG && ! -e $STATE/role && ! -e $SERVICE && ! -e $LEGACY_SERVICE ]] || fail "Interface already configured; choose another AWG_INTERFACE"
         ip link show dev "$INTERFACE" >/dev/null 2>&1 && fail "Interface already exists"
         ROLE=$1
         if [[ $ROLE == listener ]]; then
@@ -1334,7 +1423,9 @@ fi
             echo "Matching peer key retained."
             exit
         fi
-        systemctl is-active --quiet "$UNIT" && fail "Stop $UNIT before enrolling a peer"
+        if systemctl is-active --quiet "$UNIT" || systemctl is-active --quiet "$LEGACY_UNIT"; then
+            fail "Stop the tunnel service before enrolling a peer"
+        fi
         ROLE=listener PEER_KEY=$2
         mapfile -t settings < "$STATE/settings"
         LOCAL_IP=${settings[0]} PEER_IP=${settings[1]} ENDPOINT=${settings[2]} PORT=${settings[3]}
@@ -1343,13 +1434,16 @@ fi
         ;;
     up)
         [[ $# -eq 1 ]] || fail "up takes no arguments"
-        [[ -f $CONFIG && -f $SERVICE ]] || fail "Configure listener or connector first"
+        [[ -f $CONFIG ]] || fail "Configure listener or connector first"
+        [[ ! -e $LEGACY_SERVICE ]] || fail "Run migrate first to switch the legacy service to $UNIT"
         require_profile
         require_manual_routing
         kernel_check
         grep -q '^\[Peer\]$' "$CONFIG" || fail "Enroll the connector public key first"
         grep -q '^HeaderProtectionKey = ' "$CONFIG" || fail "AWG 3 header protection is required; configure a new interface"
+        write_service
         systemctl enable --now "$UNIT"
+        route_peer
         echo "Started $UNIT. Check status and ping the peer tunnel IP."
         ;;
     *) usage; exit 1 ;;

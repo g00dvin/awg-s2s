@@ -8,9 +8,10 @@ AmneziaWG 3.1. Используется **только модуль ядра Lin
 или с одного из концов туннеля. Один сервер должен принимать входящий UDP;
 второму достаточно исходящего UDP и получения ответов.
 
-> Скрипт создаёт туннель с `Table = off`: маршруты туннеля автоматически
-> не добавляются, даже если AllowedIPs содержит `0.0.0.0/0`.
-> DNS, NAT и пересылку пакетов скрипт не настраивает. Маршрутизацией управляете вы.
+> Скрипт создаёт туннель с `Table = off` и отдельно добавляет только маршрут
+> к туннельному `/32` другого сервера. Сети из AllowedIPs и default route
+> автоматически не добавляются, даже при `0.0.0.0/0`.
+> DNS, NAT, forwarding и остальные маршруты настраиваете вы.
 
 ## Содержание
 
@@ -291,6 +292,8 @@ AWG_PLAN_FILE="$HOME/.config/awg-s2s/office.plan" bash ./amnezia-site-to-site.sh
 Начиная с версии `1.2.2`, `0.0.0.0/0` допускается, а новые конфигурации
 используют **`Table = off` на обеих сторонах**. AllowedIPs не добавляет маршрут
 в системную таблицу: ни default route, ни маршрут к туннельному `/32` пира.
+Начиная с `1.4.0`, маршрут к туннельному `/32` пира добавляется отдельно
+службой проекта, без автоматической маршрутизации awg-quick по AllowedIPs.
 Начиная с версии `1.2.1`, широкие префиксы, содержащие собственный туннельный
 IP, допускаются, а не завершают скрипт. При `Table = off`
 само это значение не меняет системные маршруты. Проверьте маршруты, которые
@@ -601,8 +604,28 @@ AWG маскирует транспортные характеристики и 
 
 ### Ручная маршрутизация и переход с прежних версий
 
-Для проверки ping/SSH при `Table = off` нужны ручные маршруты. Минимальный пример
-для стандартных адресов, без настройки LAN или выхода в интернет:
+Начиная с версии `1.4.0`, `PostUp` после создания интерфейса добавляет только
+маршрут к туннельному адресу пира с собственным туннельным IP как источником.
+Маршрут восстанавливается при старте/рестарте службы и после загрузки системы.
+При удалении интерфейса ядро удаляет связанный с ним маршрут.
+Существующий подходящий маршрут сохраняется; конфликтующий маршрут через
+другой интерфейс/шлюз не заменяется — действие завершается понятной ошибкой.
+
+Чтобы обновить уже работающий профиль, скачайте новый скрипт и выполните
+на **обоих серверах**, указав своё имя интерфейса:
+
+```bash
+sudo env AWG_INTERFACE=awg-itr-ufo2 bash ./amnezia-site-to-site.sh up
+```
+
+Если профиль ещё использует старую службу `amnezia-site-INTERFACE.service`,
+сначала выполните `migrate` вместо `up` на каждой стороне (краткий перезапуск).
+Для уже стандартной службы команда `up` обновляет drop-in и системную копию скрипта, а также добавляет маршрут
+для уже активного интерфейса без обязательного перезапуска туннеля.
+Controller выполняет эти действия при повторном применении сохранённого плана.
+Ключи и AllowedIPs не меняются. Все LAN/default-маршруты остаются ручными.
+
+Для старых версий возможна ручная настройка только туннельных `/32`:
 
 **На listener:**
 
@@ -616,9 +639,9 @@ sudo ip route replace 10.203.77.2/32 dev awg-site
 sudo ip route replace 10.203.77.1/32 dev awg-site
 ```
 
-Замените IP и интерфейс своими значениями. Команды выполняются после запуска
-интерфейса; они не сохраняют маршруты после перезагрузки. Постоянные маршруты
-и policy routing настройте вашим сетевым менеджером или отдельной службой.
+Замените IP и интерфейс своими значениями. Эти ручные команды не сохраняют
+маршруты после перезагрузки. В `1.4.0` нужные `/32` обслуживает `PostUp` awg-quick.
+Остальные постоянные маршруты и policy routing настройте отдельно.
 Handshake использует публичный UDP-endpoint и может работать без этих маршрутов,
 а ping/SSH по адресу туннеля — нет.
 
@@ -628,7 +651,7 @@ Handshake использует публичный UDP-endpoint и может р�
 Профили прежних версий могут содержать `Table = auto`. Скрипт не переписывает
 их автоматически и при возобновлении/команде `up` требует `Table = off`.
 Для перехода остановите службу, измените строку Table в конфигурации, затем
-запустите службу и настройте маршруты вручную. При изменении AllowedIPs
+выполните `up` новой версией скрипта. При изменении AllowedIPs
 согласуйте конфигурацию и файл `allowed-ips` профиля; мастер не заменяет
 существующие AllowedIPs неявно.
 
@@ -694,7 +717,7 @@ sudo bash ./amnezia-site-to-site.sh kernel-check
 5. Проверьте соединение и повторите процедуру для второй стороны.
 
 ```bash
-sudo systemctl restart amnezia-site-awg-site.service
+sudo systemctl restart awg-quick@awg-site.service
 sudo bash ./amnezia-site-to-site.sh verify
 ping -c 3 10.203.77.2
 ```
@@ -738,23 +761,48 @@ sudo dkms install --force -m amneziawg -v OLD_VERSION -k KERNEL_RELEASE
 | `/usr/src/amneziawg-VERSION/` | Исходники DKMS |
 | `/usr/local/share/amnezia-site-source-versions` | Общая запись установленных ревизий |
 | `/usr/local/lib/amnezia-site-to-site.sh` | Системная копия скрипта для служб |
-| `amnezia-site-awg-site.service` | Служба туннеля |
+| `awg-quick@awg-site.service` | Служба туннеля |
 | `amnezia-site-firewall-awg-site.service` | Служба правил nftables |
 
 При другом имени интерфейса замените `awg-site` в соответствующих путях/службах.
 
 ```bash
-sudo systemctl status amnezia-site-awg-site.service
-sudo journalctl -u amnezia-site-awg-site.service -n 50 --no-pager
-sudo systemctl stop amnezia-site-awg-site.service
-sudo systemctl start amnezia-site-awg-site.service
-sudo systemctl restart amnezia-site-awg-site.service
-sudo awg show awg-site
+sudo systemctl status awg-quick@awg-site.service
+sudo journalctl -u awg-quick@awg-site.service -n 50 --no-pager
+sudo systemctl stop awg-quick@awg-site.service
+sudo systemctl start awg-quick@awg-site.service
+sudo systemctl restart awg-quick@awg-site.service
+sudo awg show awg-site latest-handshakes
+sudo awg show awg-site transfer
 ip -brief address show dev awg-site
 ip route get 10.203.77.2
 ```
 
-`up` включает запуск при загрузке. Остановка не удаляет конфигурацию и
+`up` включает запуск при загрузке. Служба использует стандартный шаблон
+AmneziaWG `awg-quick@.service`.
+Настройки проекта находятся в drop-in
+`/etc/systemd/system/awg-quick@awg-site.service.d/site-to-site.conf`:
+проверка модуля ядра, запрет userspace fallback и пути к установленным инструментам.
+Маршрут только до туннельного IP пира создаётся через `PostUp`; при удалении
+интерфейса ядро удаляет этот маршрут. LAN и default routes остаются ручными.
+Шаблон из пакета не перезаписывается; если он отсутствует, устанавливается
+официальный шаблон из закреплённой ревизии исходников.
+
+Для перехода со старой собственной службы (краткий перезапуск туннеля):
+
+```bash
+sudo env AWG_INTERFACE=awg-site bash ./amnezia-site-to-site.sh migrate
+sudo systemctl enable --now awg-quick@awg-site.service
+```
+
+Выполните миграцию на каждой стороне. Ключи и AllowedIPs сохраняются;
+старая служба отключается, резервная копия хранится в каталоге состояния.
+При ошибке запуска новой службы скрипт пытается вернуть старую.
+Не создавайте две активные службы для одного интерфейса.
+Механизм соответствует [официальному шаблону AmneziaWG](https://github.com/amnezia-vpn/amneziawg-tools/blob/master/src/systemd/wg-quick%40.service)
+и [реализации awg-quick (PostUp, Table)](https://github.com/amnezia-vpn/amneziawg-tools/blob/master/src/wg-quick/linux.bash).
+
+Остановка не удаляет конфигурацию и
 firewall-правила. Активная служба не доказывает наличие связи: проверяйте
 handshake и реальную доступность нужного сервиса.
 
@@ -819,7 +867,7 @@ Secure Boot. При различии установленного/загруже
 sudo awg show awg-site public-key
 sudo awg show awg-site latest-handshakes
 sudo awg show awg-site transfer
-sudo journalctl -u amnezia-site-awg-site.service -n 50 --no-pager
+sudo journalctl -u awg-quick@awg-site.service -n 50 --no-pager
 ```
 
 `verify` требует handshake за последние 180 секунд. На простаивающем
@@ -855,7 +903,7 @@ sudo systemctl status amnezia-site-firewall-awg-site.service
 ### Отключить без удаления
 
 ```bash
-sudo systemctl disable --now amnezia-site-awg-site.service
+sudo systemctl disable --now awg-quick@awg-site.service
 ```
 
 Ключи/профиль сохранятся. Для повторного включения используйте `up`.
@@ -886,6 +934,22 @@ sudo systemctl disable --now amnezia-site-firewall-awg-site.service
 
 ## Проверки и ограничения
 
+18 сентября 2026 года версия `1.4.0` проверена на временном туннеле между
+локальным Debian 12 (`fractal`) и UFO (Ubuntu 24.04):
+
+- Стандартные `awg-quick@` службы активны и включены на обеих сторонах.
+- Свежий handshake, двусторонний ping без потерь, автоматические peer `/32`.
+- `AllowedIPs = 0.0.0.0/0` не изменил default route и `ip rule` локального хоста.
+- После перезапуска связь восстановилась; ожидание повторного handshake может
+  занять несколько секунд, поэтому немедленный ping не всегда успешен.
+- После остановки интерфейса его peer-маршрут удалился.
+- Переход с тестовых старых служб через `migrate` прошёл на обеих сторонах;
+  контрольные суммы private/header/preshared ключей не изменились.
+- Рабочие профили UFO не мигрировались и не останавливались.
+- Временные интерфейсы, конфигурации, службы и правила firewall удалены.
+
+Это проверка доступного локального хоста `fractal`, а не `vpn-gw-01`.
+
 17 сентября 2026 года выполнена живая проверка между Debian 12 с ядром
 `6.1.0-53-amd64` и Ubuntu 24.04 с ядром `6.8.0-139-generic`:
 
@@ -906,7 +970,7 @@ controller целиком или будущих upstream-обновлений.
 - Нет автоматической настройки LAN-forwarding, возвратных маршрутов, NAT, full-tunnel и IPv6-профилей.
 - Нет настройки SSH-сервера, firewall провайдера и регистрации Secure Boot-ключа.
 - Автоматический nftables требует простого ruleset; автоматические разрешения широкие.
-- Нет автоматической миграции, ротации ключей, отката и удаления.
+- Миграция старой службы выполняется отдельной командой `migrate`; нет мастера ротации ключей, полного отката установки и удаления.
 - Сохранение параметров не заменяет SSH-агент/SSH-конфигурацию и не сохраняет пароли.
 
 ## Официальные материалы
